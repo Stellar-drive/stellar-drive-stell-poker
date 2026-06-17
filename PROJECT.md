@@ -126,4 +126,4 @@ The patterns here are general-purpose and reusable:
 
 ---
 
-**[Live Demo](https://stell-poker.vercel.app)** · **[Repository](https://github.com/Stellar-drive/stellar-drive-stell-poker)** · **[Architecture Slide Deck](https://www.canva.com/design/DAHB5JrdEAk/XThK1QgbEATHwZ0rX-W2aA/view?utm_content=DAHB5JrdEAk&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=hb4aca74548)**
+**[Live Demo](https://stellar-poker-six.vercel.app)** · **[Repository](https://github.com/Stellar-drive/stellar-drive-stell-poker)** · **[Architecture Slide Deck](https://www.canva.com/design/DAHB5JrdEAk/XThK1QgbEATHwZ0rX-W2aA/view?utm_content=DAHB5JrdEAk&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=hb4aca74548)**

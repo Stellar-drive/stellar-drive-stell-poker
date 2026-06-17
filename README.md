@@ -7,7 +7,7 @@ Onchain Texas Hold'em poker on Stellar with cryptographically private cards usin
 
 No single party ever sees the full deck. A 3-node MPC committee (TACEO coNoir) shuffles and deals cards using REP3 secret sharing. UltraHonk ZK proofs verify every deal, reveal, and showdown onchain via Soroban's native BN254 host functions.
 
-**[Live Demo](https://stell-poker.vercel.app)** · [Demo Video](#) · [Slide Deck](https://www.canva.com/design/DAHB5JrdEAk/XThK1QgbEATHwZ0rX-W2aA/view?utm_content=DAHB5JrdEAk&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=hb4aca74548)
+**[Live Demo](https://stellar-poker-six.vercel.app)** · [Demo Video](#) · [Slide Deck](https://www.canva.com/design/DAHB5JrdEAk/XThK1QgbEATHwZ0rX-W2aA/view?utm_content=DAHB5JrdEAk&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=hb4aca74548)
 
 ![Gameplay](assets/game.png)
 
@@ -174,7 +174,7 @@ NETWORK=testnet ./scripts/deploy.sh
 
 ## What is live vs mocked in the demo
 
-The live demo at [stell-poker.vercel.app](https://stell-poker.vercel.app) runs against Stellar testnet. Here is exactly what is live and what is simulated:
+The live demo at [stellar-poker-six.vercel.app](https://stellar-poker-six.vercel.app) runs against Stellar testnet. Here is exactly what is live and what is simulated:
 
 | Component | Status | Notes |
 |---|---|---|
