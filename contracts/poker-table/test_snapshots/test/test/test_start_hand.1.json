@@ -91,6 +91,22 @@
                     },
                     {
                       "key": {
+                        "symbol": "min_players"
+                      },
+                      "val": {
+                        "u32": 2
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "rake_bps"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "small_blind"
                       },
                       "val": {
@@ -420,6 +436,22 @@
                         },
                         {
                           "key": {
+                            "symbol": "min_players"
+                          },
+                          "val": {
+                            "u32": 2
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "rake_bps"
+                          },
+                          "val": {
+                            "u32": 0
+                          }
+                        },
+                        {
+                          "key": {
                             "symbol": "small_blind"
                           },
                           "val": {
@@ -563,6 +595,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "committed"
+                              },
+                              "val": {
+                                "i128": "5"
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "folded"
                               },
                               "val": {
@@ -623,6 +663,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "committed"
+                              },
+                              "val": {
+                                "i128": "10"
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "folded"
                               },
                               "val": {
@@ -668,6 +716,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "rake_balance"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "session_id"
                     },
                     "val": {
@@ -688,7 +744,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 518400
       },
       {
         "entry": {
@@ -720,7 +776,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 518400
       },
       {
         "entry": {
@@ -1139,7 +1195,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 518400
       }
     ]
   },
