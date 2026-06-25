@@ -1,0 +1,9 @@
+name: stellar-drive-stell-poker/rust-contract-queries
+version: 0.1.0
+library: false
+dependencies:
+  codeql/rust-all: "*"
+description: >
+  Custom CodeQL security queries for the stellar-drive-stell-poker Soroban smart contracts.
+  Covers: panic unwraps, arithmetic overflow, unchecked authorization, and
+  storage key collisions.
