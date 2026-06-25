@@ -98,7 +98,6 @@ export function useTurnNotification({
           body,
           icon: "/icon.svg",
           tag: "stellar-drive-stell-poker-turn",
-          renotify: true,
         });
       } catch {
         // Notification API unavailable in this context
