@@ -1,0 +1,11 @@
+apiVersion: v2
+name: coordinator
+description: stellar-drive-stell-poker MPC Coordinator — orchestrates the MPC committee and serves the REST/WebSocket API
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - stellar-drive-stell-poker
+  - mpc
+  - coordinator
+home: https://github.com/Stellar-drive/stellar-drive-stell-poker
