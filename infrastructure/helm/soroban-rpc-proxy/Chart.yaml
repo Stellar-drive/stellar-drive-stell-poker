@@ -1,0 +1,11 @@
+apiVersion: v2
+name: soroban-rpc-proxy
+description: Soroban RPC proxy for stellar-drive-stell-poker — runs stellar/quickstart and exposes the Soroban JSON-RPC endpoint
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - stellar-drive-stell-poker
+  - soroban
+  - stellar
+home: https://github.com/Stellar-drive/stellar-drive-stell-poker
