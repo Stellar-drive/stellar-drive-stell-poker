@@ -1,0 +1,11 @@
+apiVersion: v2
+name: frontend
+description: stellar-drive-stell-poker Next.js web application
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - stellar-drive-stell-poker
+  - frontend
+  - nextjs
+home: https://github.com/Stellar-drive/stellar-drive-stell-poker

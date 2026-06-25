@@ -1,0 +1,11 @@
+apiVersion: v2
+name: mpc-node
+description: stellar-drive-stell-poker MPC Node — REP3 co-Noir participant. Runs as a StatefulSet of exactly 3 replicas.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - stellar-drive-stell-poker
+  - mpc
+  - co-noir
+home: https://github.com/Stellar-drive/stellar-drive-stell-poker
