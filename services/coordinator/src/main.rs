@@ -30,7 +30,7 @@ use prometheus::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use sysinfo::{get_current_pid, ProcessesToUpdate, System};
@@ -40,6 +40,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 mod api;
+mod api_version;
 mod archiver;
 mod audit_log;
 mod cors_db;
@@ -49,10 +50,13 @@ mod db;
 mod discovery;
 mod feature_flags;
 mod hot_reload;
+mod idempotency;
 mod leader_election;
 mod mpc;
 mod mpc_auth_middleware;
+mod node_reliability;
 mod plugin;
+mod proof_cache;
 mod rate_limit_db;
 #[path = "middleware.rs"]
 mod request_log;
@@ -261,6 +265,17 @@ struct AppState {
     pub plugin_loader: Arc<tokio::sync::RwLock<plugin::PluginLoader>>,
     /// Shared key ring for encrypting sensitive in-memory fields.
     enc_key: Arc<crypto::EncryptionKey>,
+    /// When true, non-admin API routes reject requests with 503 (drain mode).
+    pub maintenance_mode: Arc<AtomicBool>,
+    /// Shared HTTP client used for all coordinator → MPC node calls.
+    mpc_client: reqwest::Client,
+    /// Whether this coordinator instance currently holds the leader lock.
+    leader_state: leader_election::LeaderState,
+    /// In-memory registry of dynamically discovered MPC nodes (used when
+    /// static `MPC_NODE_*` endpoints and the committee registry are unset).
+    node_registry: Arc<RwLock<discovery::NodeRegistry>>,
+    /// Idempotency key cache for mutation endpoints (Issue #106).
+    idempotency_store: idempotency::IdempotencyStore,
 }
 
 #[derive(Clone)]
@@ -349,6 +364,10 @@ async fn main() {
     let committee_secret = crypto::EncryptedField::encrypt(&enc_key, &committee_secret_plaintext)
         .expect("failed to encrypt committee_secret");
 
+    // If any MPC_NODE_* env var is explicitly set, treat the endpoints as
+    // statically configured and disable dynamic discovery (backward compat).
+    let static_endpoints_configured =
+        (0..3).any(|i| std::env::var(format!("MPC_NODE_{}", i)).is_ok());
     let mpc_config = MpcConfig {
         node_endpoints: vec![
             std::env::var("MPC_NODE_0").unwrap_or_else(|_| "http://localhost:8101".to_string()),
@@ -600,17 +619,6 @@ async fn main() {
     let archive_store = archiver::new_store();
     archiver::load_existing_archives(&archive_store, &archive_config).await;
 
-    if let Some(path) = hot_reload_snapshot {
-        hot_reload::spawn_snapshot_task(path, tables, lobby_assignments);
-    }
-
-    archiver::spawn_archive_task(
-        state.mpc_sessions.clone(),
-        Arc::clone(&state.tables),
-        archive_store.clone(),
-        archive_config,
-    );
-
     let state = AppState {
         tables: Arc::clone(&tables),
         lobby_assignments: Arc::clone(&lobby_assignments),
@@ -629,7 +637,24 @@ async fn main() {
         instance_id,
         plugin_loader,
         enc_key,
+        maintenance_mode: Arc::new(AtomicBool::new(false)),
+        mpc_client,
+        leader_state,
+        node_registry: Arc::new(RwLock::new(discovery::NodeRegistry::new())),
+        idempotency_store: idempotency::new_store(),
     };
+    idempotency::spawn_gc_task(state.idempotency_store.clone());
+
+    if let Some(path) = hot_reload_snapshot {
+        hot_reload::spawn_snapshot_task(path, Arc::clone(&tables), Arc::clone(&lobby_assignments));
+    }
+
+    archiver::spawn_archive_task(
+        state.mpc_sessions.clone(),
+        Arc::clone(&state.tables),
+        archive_store.clone(),
+        archive_config,
+    );
 
     // Spawn background node health check task
     let node_healths = state.metrics.node_healths.clone();
@@ -811,6 +836,10 @@ async fn main() {
             post(api::admin_purge_archives),
         )
         .layer(axum::middleware::from_fn_with_state(
+            state.idempotency_store.clone(),
+            idempotency::idempotency_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             maintenance_middleware,
         ))
@@ -824,6 +853,7 @@ async fn main() {
         ))
         .layer(middleware::from_fn(request_log::log_request))
         .layer(build_cors_layer(state.db_pool.as_deref()).await)
+        .layer(middleware::from_fn(api_version::rewrite_and_tag_version))
         .with_state(state);
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
