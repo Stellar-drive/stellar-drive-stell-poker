@@ -25,6 +25,8 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::node_reliability;
+
 // ── TLS client factory ────────────────────────────────────────────────────────
 
 /// Build the shared `reqwest::Client` used for all coordinator → MPC node calls.
@@ -221,13 +223,19 @@ async fn prepare_from_nodes(
         let body = body.clone();
         let client = client.clone();
         let op = operation_name.to_string();
+        let endpoint = endpoint.clone();
         let handle = tokio::spawn(async move {
+            let call_start = std::time::Instant::now();
             let resp = client
                 .post(&url)
                 .json(&body)
                 .send()
                 .await
                 .map_err(|e| format!("failed to call node {} {}: {}", idx, op, e))?;
+            // Graceful degradation (issue #110): track round-trip latency so
+            // persistently slow nodes are logged and scored, without failing
+            // this call — the node did respond, just slowly.
+            node_reliability::record(&endpoint, call_start.elapsed()).await;
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -637,22 +645,46 @@ async fn trigger_and_collect_proof(
         handle.await.map_err(|e| format!("join error: {}", e))??;
     }
 
-    // Poll node 0 for proof completion.
+    // Poll node 0 for proof completion. Graceful degradation (issue #110): a
+    // node that is merely slow — not dead — extends the poll deadline
+    // instead of failing the whole session, up to a bounded hard ceiling so
+    // a genuinely unresponsive node still eventually times out.
     let proof_node = &node_endpoints[0];
-    let max_polls = if circuit_name == "showdown_valid" {
+    let base_max_polls: u32 = if circuit_name == "showdown_valid" {
         900
     } else {
         300
     };
-    for _ in 0..max_polls {
+    let hard_ceiling = base_max_polls * 2;
+    let mut deadline_polls = base_max_polls;
+
+    let mut polls_done: u32 = 0;
+    while polls_done < deadline_polls {
+        polls_done += 1;
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
         let status_url = format!("{}/session/{}/status", proof_node, session_id);
-        let resp = client
-            .get(&status_url)
-            .send()
-            .await
-            .map_err(|e| format!("failed to poll node 0: {}", e))?;
+        let poll_start = std::time::Instant::now();
+        let resp = client.get(&status_url).send().await;
+        let was_slow = node_reliability::record(proof_node, poll_start.elapsed()).await;
+        if was_slow && deadline_polls < hard_ceiling {
+            deadline_polls = (deadline_polls + 1).min(hard_ceiling);
+            tracing::warn!(
+                node = %proof_node,
+                session_id = %session_id,
+                latency_ms = poll_start.elapsed().as_millis(),
+                extended_deadline_polls = deadline_polls,
+                "MPC node slow during proof polling; extending session deadline"
+            );
+        }
+
+        let resp = match resp {
+            Ok(r) => r,
+            // A transient poll failure is treated the same as a slow
+            // response above: retry within the (possibly extended)
+            // deadline rather than aborting the session immediately.
+            Err(_) => continue,
+        };
 
         if !resp.status().is_success() {
             continue;
@@ -704,8 +736,10 @@ async fn trigger_and_collect_proof(
     }
 
     Err(format!(
-        "[{}] proof generation timed out after {} seconds",
-        session_id, max_polls
+        "[{}] proof generation timed out after {} seconds ({} of them from deadline extensions granted to slow nodes)",
+        session_id,
+        polls_done,
+        deadline_polls.saturating_sub(base_max_polls)
     ))
 }
 

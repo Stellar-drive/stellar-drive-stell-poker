@@ -21,6 +21,15 @@ pub async fn submit_deal_proof(
         return Ok(String::new());
     }
 
+    // Issue #108: content-addressable cache of already-verified proofs, so a
+    // retried submission of byte-identical proof data skips the (expensive)
+    // on-chain re-verification and just replays the prior tx hash.
+    let cache_key = crate::proof_cache::proof_key(proof, public_inputs);
+    if let Some(tx_hash) = crate::proof_cache::get(&cache_key).await {
+        tracing::info!("Deal proof cache hit — skipping redundant on-chain verification");
+        return Ok(tx_hash);
+    }
+
     maybe_start_hand_for_deal(config, table_id).await?;
 
     let onchain_table_id = resolve_onchain_table_id(config, table_id);
@@ -63,7 +72,9 @@ pub async fn submit_deal_proof(
     )
     .await?;
 
-    parse_tx_result(output)
+    let tx_hash = parse_tx_result(output)?;
+    crate::proof_cache::insert(cache_key, tx_hash.clone()).await;
+    Ok(tx_hash)
 }
 
 async fn maybe_start_hand_for_deal(config: &SorobanConfig, table_id: u32) -> Result<(), String> {
@@ -119,6 +130,12 @@ pub async fn submit_reveal_proof(
         return Ok(String::new());
     }
 
+    let cache_key = crate::proof_cache::proof_key(proof, public_inputs);
+    if let Some(tx_hash) = crate::proof_cache::get(&cache_key).await {
+        tracing::info!("Reveal proof cache hit — skipping redundant on-chain verification");
+        return Ok(tx_hash);
+    }
+
     let onchain_table_id = resolve_onchain_table_id(config, table_id);
     let committee_addr = config.committee_address()?;
     let converted_proof = convert_keccak_proof_to_soroban(proof)?;
@@ -149,7 +166,9 @@ pub async fn submit_reveal_proof(
     )
     .await?;
 
-    parse_tx_result(output)
+    let tx_hash = parse_tx_result(output)?;
+    crate::proof_cache::insert(cache_key, tx_hash.clone()).await;
+    Ok(tx_hash)
 }
 
 /// Submit a showdown proof to the on-chain poker-table contract via `submit_showdown`.
@@ -163,6 +182,12 @@ pub async fn submit_showdown_proof(
     if !config.is_configured() {
         tracing::warn!("Soroban not configured, skipping showdown proof submission");
         return Ok(String::new());
+    }
+
+    let cache_key = crate::proof_cache::proof_key(proof, public_inputs);
+    if let Some(tx_hash) = crate::proof_cache::get(&cache_key).await {
+        tracing::info!("Showdown proof cache hit — skipping redundant on-chain verification");
+        return Ok(tx_hash);
     }
 
     let onchain_table_id = resolve_onchain_table_id(config, table_id);
@@ -193,7 +218,9 @@ pub async fn submit_showdown_proof(
     )
     .await?;
 
-    parse_tx_result(output)
+    let tx_hash = parse_tx_result(output)?;
+    crate::proof_cache::insert(cache_key, tx_hash.clone()).await;
+    Ok(tx_hash)
 }
 
 /// Convert co-noir keccak proof format to the Soroban/BB UltraHonk verifier format.
