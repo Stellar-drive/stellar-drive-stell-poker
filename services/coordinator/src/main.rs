@@ -54,12 +54,14 @@ mod idempotency;
 mod leader_election;
 mod mpc;
 mod mpc_auth_middleware;
+mod mpc_benchmark;
 mod node_reliability;
 mod plugin;
 mod proof_cache;
 mod rate_limit_db;
 #[path = "middleware.rs"]
 mod request_log;
+mod session_cache;
 mod session_gc;
 mod session_migration;
 mod soroban;
@@ -276,6 +278,8 @@ struct AppState {
     node_registry: Arc<RwLock<discovery::NodeRegistry>>,
     /// Idempotency key cache for mutation endpoints (Issue #106).
     idempotency_store: idempotency::IdempotencyStore,
+    /// MPC deal phase benchmarks (Issue #100).
+    benchmark_store: mpc_benchmark::BenchmarkStore,
 }
 
 #[derive(Clone)]
@@ -511,6 +515,7 @@ async fn main() {
 
     let admin_config = AdminConfig::from_env();
     let admin_state = AdminState::new();
+    let benchmark_store = mpc_benchmark::new_store();
 
     // Spawn the Horizon event indexer if Soroban is configured.
     if soroban_config.is_configured() && !soroban_config.poker_table_contract.is_empty() {
@@ -642,6 +647,7 @@ async fn main() {
         leader_state,
         node_registry: Arc::new(RwLock::new(discovery::NodeRegistry::new())),
         idempotency_store: idempotency::new_store(),
+        benchmark_store,
     };
     idempotency::spawn_gc_task(state.idempotency_store.clone());
 
@@ -723,6 +729,7 @@ async fn main() {
         .route("/api/health", get(health))
         .route("/api/leader", get(get_leader_status))
         .route("/api/stats", get(get_stats))
+        .route("/api/benchmarks", get(get_benchmarks))
         // Dynamic MPC node discovery (active only when neither the committee
         // registry nor static MPC_NODE_* endpoints are configured).
         .route("/api/node/register", post(api::register_node))
@@ -1157,6 +1164,15 @@ async fn handle_chat_socket(socket: WebSocket, table_id: u32, state: AppState) {
 async fn get_stats(State(state): State<AppState>) -> Json<stats::StatsResponse> {
     let ttl = std::time::Duration::from_secs(30);
     Json(stats::get_stats(&state.stats, ttl).await)
+}
+
+async fn get_benchmarks(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let benchmarks = mpc_benchmark::get_benchmarks(&state.benchmark_store, None);
+    let stats = mpc_benchmark::get_benchmark_stats(&benchmarks);
+    Json(serde_json::json!({
+        "samples": benchmarks,
+        "stats": stats,
+    }))
 }
 
 /// GET /api/leader

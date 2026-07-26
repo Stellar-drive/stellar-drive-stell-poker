@@ -358,6 +358,45 @@ impl CommitteeRegistryContract {
         stake
     }
 
+    /// Admin removes a node from committee due to threshold failures.
+    /// Emits NodeDeregistered event and marks member inactive.
+    pub fn deregister_node_on_failure(env: Env, admin: Address, node: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&RegistryKey::Admin)
+            .expect("not initialized");
+        assert!(constant_time::address_eq(&env, &admin, &stored_admin), "not admin");
+        assert!(
+            !env.storage()
+                .instance()
+                .get::<RegistryKey, bool>(&RegistryKey::Paused)
+                .unwrap_or(false),
+            "contract paused"
+        );
+
+        let mut m: CommitteeMember = env
+            .storage()
+            .persistent()
+            .get(&RegistryKey::Member(node.clone()))
+            .expect("node not registered");
+
+        assert!(m.active, "node already inactive");
+
+        m.active = false;
+        m.slash_count = m.slash_count.saturating_add(1);
+
+        env.storage()
+            .persistent()
+            .set(&RegistryKey::Member(node.clone()), &m);
+
+        env.events().publish(
+            (Symbol::new(&env, "node_deregistered"), node.clone()),
+            (Symbol::new(&env, "failure_threshold"), m.slash_count),
+        );
+    }
+
     /// Admin creates a new committee epoch with selected members.
     pub fn create_epoch(env: Env, admin: Address, members: Vec<Address>, threshold: u32) -> u32 {
         admin.require_auth();
