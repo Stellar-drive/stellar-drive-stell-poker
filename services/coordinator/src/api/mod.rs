@@ -438,7 +438,7 @@ pub async fn request_deal(
         table_id,
         &prepared_deal.share_set_ids,
         &proof_session_id,
-        "deal_valid",
+        &req.circuit_name,
         &state.mpc_config.circuit_dir,
         &node_endpoints,
     )

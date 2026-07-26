@@ -10,6 +10,12 @@ pub struct SetFlagBody {
 #[derive(Deserialize, ToSchema)]
 pub struct DealRequest {
     pub players: Vec<String>,
+    #[serde(default = "default_circuit")]
+    pub circuit_name: String,
+}
+
+fn default_circuit() -> String {
+    "deal_valid".to_string()
 }
 
 #[derive(Serialize, ToSchema)]
