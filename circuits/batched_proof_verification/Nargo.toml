@@ -1,0 +1,5 @@
+[package]
+name = "batched_proof_verification"
+type = "bin"
+authors = ["stellar-drive-stell-poker"]
+compiler_version = ">=0.31.0"
