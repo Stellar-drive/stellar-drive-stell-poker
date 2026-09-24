@@ -15,6 +15,7 @@ import { webcrypto } from "node:crypto";
 
 const STORAGE_PREFIX = "stellar-drive-stell-poker-encrypted-session-";
 
+/** Encrypted Session Payload shape. */
 export interface EncryptedSessionPayload {
   tableId: number;
   handNumber: number;
@@ -26,6 +27,7 @@ export interface EncryptedSessionPayload {
   updatedAt: number;
 }
 
+/** Restored Hand State shape. */
 export interface RestoredHandState {
   tableId: number;
   handNumber: number;
