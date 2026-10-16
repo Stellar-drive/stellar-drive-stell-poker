@@ -1,17 +1,53 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+#[cfg(feature = "arbitrary")]
+use arbitrary::Arbitrary;
+
+/// Shared query parameters for offset/limit paginated endpoints.
+#[derive(Deserialize, ToSchema)]
+pub struct PaginatedQuery {
+    pub offset: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+/// Per-node MPC phase progress for a specific table, returned by
+/// `GET /api/table/:table_id/mpc-status` and included in WebSocket pushes.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct MpcNodeProgress {
+    pub endpoint: String,
+    pub phase: String,
+    pub healthy: bool,
+    pub elapsed_secs: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TableMpcStatusResponse {
+    pub table_id: u32,
+    pub phase: String,
+    pub nodes: Vec<MpcNodeProgress>,
+    pub active_sessions: usize,
+}
 
 /// Request body for `POST /api/flags/:key`.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct SetFlagBody {
     pub enabled: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 pub struct DealRequest {
     pub players: Vec<String>,
+    #[serde(default = "default_circuit")]
+    pub circuit_name: String,
 }
 
-#[derive(Serialize)]
+fn default_circuit() -> String {
+    "deal_valid".to_string()
+}
+
+#[derive(Serialize, ToSchema)]
 pub struct DealResponse {
     pub status: String,
     pub deck_root: String,
@@ -21,7 +57,7 @@ pub struct DealResponse {
     pub tx_hash: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct RevealResponse {
     pub status: String,
     pub cards: Vec<u32>,
@@ -30,7 +66,7 @@ pub struct RevealResponse {
     pub tx_hash: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct ShowdownResponse {
     pub status: String,
     pub winner: String,
@@ -40,13 +76,17 @@ pub struct ShowdownResponse {
     pub tx_hash: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 pub struct PlayerActionRequest {
     pub action: String,
     pub amount: Option<i128>,
+    /// Monotonically increasing sequence number for (player, table).
+    /// Prevents replay / front-running attacks on betting actions.
+    pub seq: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PlayerActionResponse {
     pub status: String,
     pub action: String,
@@ -55,12 +95,12 @@ pub struct PlayerActionResponse {
     pub tx_hash: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct TableStateResponse {
     pub state: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PlayerCardsResponse {
     pub card1: u32,
     pub card2: u32,
@@ -68,7 +108,7 @@ pub struct PlayerCardsResponse {
     pub salt2: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct CommitteeStatusResponse {
     pub nodes: usize,
     pub healthy: Vec<bool>,
@@ -78,42 +118,88 @@ pub struct CommitteeStatusResponse {
     pub draining: Vec<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, ToSchema)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub struct RegisterNodeRequest {
+    /// Stable node identifier (e.g. "0", "1", "2").
+    pub id: String,
+    /// Base URL the coordinator should use to reach the node.
+    pub endpoint: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct NodeRegistryResponse {
+    pub id: String,
+    /// Total registered nodes after the operation.
+    pub registered: usize,
+    /// Number currently considered healthy.
+    pub healthy: usize,
+}
+
+#[derive(Serialize, ToSchema)]
 pub struct ChainConfigResponse {
     pub rpc_url: String,
     pub network_passphrase: String,
     pub poker_table_contract: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 pub struct CreateTableRequest {
     pub max_players: Option<u32>,
     pub solo: Option<bool>,
     pub buy_in: Option<String>,
+    pub region: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct CreateTableResponse {
     pub table_id: u32,
     pub max_players: u32,
     pub joined_wallets: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct OpenTablesResponse {
     pub tables: Vec<OpenTableInfo>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct OpenTableInfo {
     pub table_id: u32,
     pub phase: String,
     pub max_players: u32,
     pub joined_wallets: usize,
     pub open_wallet_slots: usize,
+    /// Live anonymous spectators (Issue #171).
+    pub spectators: usize,
 }
 
-#[derive(Serialize)]
+/// Multi-table overview entry for the mini-map (Issue #53).
+#[derive(Serialize, ToSchema, Clone)]
+pub struct TableOverviewInfo {
+    pub table_id: u32,
+    pub phase: String,
+    pub max_players: u32,
+    pub seated: usize,
+    pub total_chips: i64,
+    pub stacks: Vec<i64>,
+    /// Live anonymous spectators (Issue #171).
+    pub spectators: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SpectatorCountResponse {
+    pub table_id: u32,
+    pub spectator_count: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TableOverviewResponse {
+    pub tables: Vec<TableOverviewInfo>,
+}
+
+#[derive(Serialize, ToSchema)]
 pub struct JoinTableResponse {
     pub table_id: u32,
     pub seat_index: u32,
@@ -122,7 +208,7 @@ pub struct JoinTableResponse {
     pub max_players: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct TableLobbyResponse {
     pub table_id: u32,
     pub phase: String,
@@ -131,32 +217,68 @@ pub struct TableLobbyResponse {
     pub joined_wallets: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct LobbySeat {
     pub seat_index: u32,
     pub chain_address: String,
     pub wallet_address: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub struct RitOptInRequest {
+    pub opt_in: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct RitOptInResponse {
+    pub status: String,
+    pub tx_hash: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
 pub struct WalletChallengeRequest {
     pub address: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct WalletChallengeResponse {
     pub challenge: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct WalletVerifyRequest {
     pub address: String,
     pub challenge: String,
     pub signature: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct WalletVerifyResponse {
     pub verified: bool,
 }
 
+/// Request body for cross-table chip transfer.
+/// Allows a player to transfer chips from one table to another they are seated at.
+/// A small fee is deducted from the transferred amount.
+#[derive(Deserialize, ToSchema)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub struct TransferChipsRequest {
+    /// Destination table ID where chips will be transferred to.
+    pub destination_table_id: u32,
+    /// Amount of chips to transfer (before fee deduction).
+    pub amount: i128,
+}
+
+/// Response for cross-table chip transfer.
+#[derive(Serialize, ToSchema)]
+pub struct TransferChipsResponse {
+    pub status: String,
+    pub source_table_id: u32,
+    pub destination_table_id: u32,
+    pub amount: i128,
+    pub fee: i128,
+    pub net_amount: i128,
+    pub source_tx_hash: Option<String>,
+    pub dest_tx_hash: Option<String>,
+}

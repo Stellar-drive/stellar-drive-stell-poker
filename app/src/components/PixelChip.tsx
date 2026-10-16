@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
+
 /**
  * PixelChip — CSS-only pixel art poker chip sprites.
  * Four denominations: white (25), red (100), blue (500), gold (1000).
@@ -19,6 +21,9 @@ interface PixelChipProps {
   size?: number;
 }
 
+/** Renders Pixel Chip.
+ * @param props(object) - props(object).
+ */
 export function PixelChip({ color = "red", size = 3 }: PixelChipProps) {
   const c = CHIP_COLORS[color];
   const px = size;
@@ -111,6 +116,9 @@ interface PixelChipStackProps {
   size?: number;
 }
 
+/** Renders Pixel Chip Stack.
+ * @param props(object) - props(object).
+ */
 export function PixelChipStack({ amount, size = 2 }: PixelChipStackProps) {
   const chips = representativeChips(amount);
   if (chips.length === 0) return null;
@@ -147,6 +155,9 @@ interface PotChipPileProps {
   size?: number;
 }
 
+/** Renders Pot Chip Pile.
+ * @param props(object) - props(object).
+ */
 export function PotChipPile({ amount, size = 3 }: PotChipPileProps) {
   const chips = representativeChips(amount);
   if (chips.length === 0) return null;
@@ -173,3 +184,60 @@ export function PotChipPile({ amount, size = 3 }: PotChipPileProps) {
     </div>
   );
 }
+
+/** Custom hook for animating numeric chip counts using requestAnimationFrame on bet/raise (#54). */
+export function useAnimatedCounter(targetValue: number, duration = 400): number {
+  const [displayValue, setDisplayValue] = useState(targetValue);
+  const prevValueRef = useRef(targetValue);
+
+  useEffect(() => {
+    const startValue = prevValueRef.current;
+    if (startValue === targetValue) return;
+
+    let startTime: number | null = null;
+    let animId: number;
+
+    const step = (timestamp: number) => {
+      if (!startTime) startTime = timestamp;
+      const progress = Math.min((timestamp - startTime) / duration, 1);
+      // Ease-out cubic formula
+      const easeProgress = 1 - Math.pow(1 - progress, 3);
+      const current = Math.round(startValue + (targetValue - startValue) * easeProgress);
+      setDisplayValue(current);
+
+      if (progress < 1) {
+        animId = requestAnimationFrame(step);
+      } else {
+        prevValueRef.current = targetValue;
+      }
+    };
+
+    animId = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(animId);
+  }, [targetValue, duration]);
+
+  return displayValue;
+}
+
+/** Component that renders an animated chip counter text value. */
+export function AnimatedChipCounter({ value, prefix = "", suffix = "", className, style }: {
+  value: number;
+  prefix?: string;
+  suffix?: string;
+  className?: string;
+  style?: React.CSSProperties;
+}) {
+  const animatedValue = useAnimatedCounter(value);
+  return (
+    <span className={className} style={style}>
+      {prefix}{animatedValue.toLocaleString()}{suffix}
+    </span>
+  );
+}
+
+/** Animated version of PixelChipStack that smoothly animates chip stack counts. */
+export function AnimatedChipStack({ amount, size = 2 }: PixelChipStackProps) {
+  const animatedAmount = useAnimatedCounter(amount);
+  return <PixelChipStack amount={animatedAmount} size={size} />;
+}
+

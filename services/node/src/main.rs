@@ -11,22 +11,48 @@
 //! 5. Coordinator polls GET /session/:id/status and retrieves proof via GET /session/:id/proof
 //!
 //! co-noir handles peer-to-peer MPC communication internally via TCP (ports 10000-10002).
+//!
+//! ## TLS and coordinator certificate pinning
+//!
+//! When TLS environment variables are set (`TLS_SERVER_CERT_PATH` / `TLS_SERVER_KEY_PATH`
+//! or the `_B64` variants), the node serves HTTPS instead of plain HTTP.
+//!
+//! Optionally, the coordinator's identity can be pinned via:
+//! - `COORDINATOR_TLS_PIN_PUBKEY_HASH` – SHA-256 hex of the coordinator's SPKI
+//! - `COORDINATOR_TLS_PIN_CERT_PATH` / `COORDINATOR_TLS_PIN_CERT_B64` – full cert pin
+//!
+//! When a pin is set, the node demands mutual TLS (mTLS) and rejects any
+//! connection whose client certificate does not match the pin.
+
+mod config_validation;
+mod crypto;
 
 use axum::{
     routing::{get, post},
     Router,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 mod api;
 mod cost;
+mod gossip;
+mod heartbeat;
+mod limits;
+mod metrics;
+mod pool;
 mod private_table;
+mod redact;
+mod profiling;
 mod session;
+mod tls;
 
+use limits::ResourceLimits;
+use metrics::NodeMetrics;
 use private_table::PrivateTableState;
+use profiling::ProfileRegistry;
 use session::MpcSessionState;
 
 #[derive(Clone)]
@@ -40,6 +66,20 @@ pub struct NodeState {
     /// finishes in-flight sessions but refuses new ones. Advertised via
     /// GET /health (`draining`) and set via DRAIN_MODE env or POST /admin/drain.
     pub draining: Arc<AtomicBool>,
+    /// Per-node resource ceilings guarding against exhaustion / session flooding.
+    pub limits: ResourceLimits,
+    /// Prometheus metrics: active sessions, proofs generated, error counts (Issue #101).
+    pub metrics: NodeMetrics,
+    /// Session IDs that have already completed proof generation (issue #241).
+    ///
+    /// Kept independently of `sessions` (which is never pruned today, but is
+    /// not guaranteed to stay that way) so a replayed session_id is rejected
+    /// even if the corresponding entry in `sessions` were ever removed —
+    /// once a session has finished, the coordinator cannot reopen it by
+    /// resubmitting shares under the same session_id.
+    pub finalized_sessions: Arc<RwLock<HashSet<String>>>,
+    /// Replay protection: (session_id, source_party_id) -> seen nonces (Issue #500).
+    pub seen_share_nonces: Arc<RwLock<HashMap<(String, u32), HashSet<u64>>>>,
 }
 
 fn drain_mode_from_env() -> bool {
@@ -57,10 +97,35 @@ pub fn is_draining(state: &NodeState) -> bool {
 async fn main() {
     let log_format = std::env::var("REQUEST_LOG_FORMAT").unwrap_or_default();
     if log_format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt().json().init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(redact::RedactingMakeWriter::new(std::io::stdout))
+            .init();
     } else {
-        tracing_subscriber::fmt().init();
+        tracing_subscriber::fmt()
+            .with_writer(redact::RedactingMakeWriter::new(std::io::stdout))
+            .init();
     }
+
+    // ── Startup configuration validation (Issue #240) ───────────────────────
+    let validation = config_validation::validate_config().await;
+    for warning in &validation.warnings {
+        tracing::warn!("config validation: {}", warning);
+    }
+    if !validation.is_ok() {
+        for error in &validation.errors {
+            tracing::error!("config validation: {}", error);
+        }
+        tracing::error!(
+            "MPC node startup aborted: {} configuration error(s) found",
+            validation.errors.len()
+        );
+        std::process::exit(1);
+    }
+    tracing::info!(
+        "Configuration validation passed ({} warning(s))",
+        validation.warnings.len()
+    );
 
     let node_id: u32 = std::env::var("NODE_ID")
         .unwrap_or_else(|_| "0".to_string())
@@ -89,9 +154,44 @@ async fn main() {
             ]
         });
 
+    let limits = ResourceLimits::from_env();
+
     tracing::info!("MPC Node {} starting on port {}", node_id, port);
     tracing::info!("Party config: {}", party_config_path);
     tracing::info!("Peer HTTP endpoints: {:?}", peer_http_endpoints);
+    tracing::info!(
+        "Resource limits: max_concurrent_sessions={}, max_session_memory_bytes={}, max_session_cpu_seconds={}, max_session_wall_seconds={}",
+        limits.max_concurrent_sessions,
+        limits.max_session_memory_bytes,
+        limits.max_session_cpu_seconds,
+        limits.max_session_wall_seconds,
+    );
+
+    // ── Startup configuration validation (Issue #240) ────────────────────────
+    let report = config_validation::validate_config().await;
+    for w in &report.warnings {
+        tracing::warn!("config: {}", w);
+    }
+    if !report.is_ok() {
+        for e in &report.errors {
+            tracing::error!("config: {}", e);
+        }
+        tracing::error!(
+            "MPC node refusing to start due to {} configuration error(s)",
+            report.errors.len()
+        );
+        std::process::exit(1);
+    }
+    tracing::info!("Configuration validation passed");
+
+    // ── TLS configuration ────────────────────────────────────────────────────
+    let tls_cfg = match tls::load_from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!("TLS configuration error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let draining = Arc::new(AtomicBool::new(drain_mode_from_env()));
     if draining.load(Ordering::SeqCst) {
@@ -106,12 +206,71 @@ async fn main() {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         tables: Arc::new(RwLock::new(HashMap::new())),
         party_config_path,
-        peer_http_endpoints,
+        peer_http_endpoints: peer_http_endpoints.clone(),
         draining,
+        limits,
+        metrics: NodeMetrics::new(),
+        finalized_sessions: Arc::new(RwLock::new(HashSet::new())),
+        seen_share_nonces: Arc::new(RwLock::new(HashMap::new())),
     };
+
+    // ── Peer connection pool health checks (Issue #246) ─────────────────────
+    pool::spawn_health_checks(peer_http_endpoints.clone());
+
+    // ── Proactive share refresh task (Issue #242) ───────────────────────────
+    private_table::spawn_share_refresh_task(state.tables.clone(), peer_http_endpoints, node_id);
+
+    // ── Background metric updaters ────────────────────────────────────────────
+    {
+        let metrics = state.metrics.clone();
+        tokio::spawn(async move {
+            let mut sys = sysinfo::System::new();
+            loop {
+                sys.refresh_memory();
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                if let Some(process) = sys.process(sysinfo::get_current_pid().unwrap()) {
+                    metrics.memory_bytes.set(process.memory() as f64 * 1024.0);
+                }
+                metrics.memory_limit_bytes.set(
+                    std::env::var("MPC_NODE_MEMORY_LIMIT_BYTES")
+                        .ok()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(2.0 * 1024.0 * 1024.0 * 1024.0), // default 2GiB
+                );
+                metrics.node_up.set(1.0);
+                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            }
+        });
+    }
+
+    // ── Certificate expiry metric ─────────────────────────────────────────────
+    {
+        let metrics = state.metrics.clone();
+        tokio::spawn(async move {
+            loop {
+                let expiry = std::env::var("MPC_NODE_CERT_EXPIRY_TIMESTAMP")
+                    .ok()
+                    .and_then(|ts| ts.parse::<i64>().ok())
+                    .map(|ts| {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        (ts - now) as f64 / 86400.0
+                    })
+                    .unwrap_or(365.0);
+                metrics
+                    .cert_expiry_days
+                    .with_label_values(&["server"])
+                    .set(expiry);
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/health", get(api::get_health))
+        .route("/metrics", get(metrics::metrics_endpoint))
         .route(
             "/table/:table_id/prepare-deal",
             post(api::post_prepare_deal),
@@ -135,9 +294,99 @@ async fn main() {
         .route("/session/:id/proof", get(api::get_proof))
         .route("/session/:id/cost", get(api::get_cost))
         .route("/admin/drain", post(api::post_admin_drain))
+        .route(
+            "/session/:id/profile",
+            post(api::post_enable_profiling).get(api::get_profile),
+        )
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    match tls_cfg {
+        // ── Plain HTTP (no TLS env vars set) ─────────────────────────────────
+        None => {
+            tracing::info!("Listening on {} (plain HTTP)", addr);
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        }
+
+        // ── TLS / mTLS ────────────────────────────────────────────────────────
+        Some(cfg) => {
+            let pin_mode = if cfg.pinned_spki_hash.is_some() {
+                "mTLS with SPKI hash pin"
+            } else if cfg.pinned_cert_der.is_some() {
+                "mTLS with full cert pin"
+            } else {
+                "TLS (no coordinator pin)"
+            };
+            tracing::info!("Listening on {} ({}) ", addr, pin_mode);
+
+            let server_config = match tls::build_server_config(cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to build TLS server config: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+
+            let tcp_listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            serve_tls(tcp_listener, acceptor, app).await;
+        }
+    }
+}
+
+/// Accept TLS connections in a loop and hand them to hyper-util for HTTP serving.
+///
+/// Each accepted TLS stream is served in its own `tokio::spawn`'d task so that
+/// a slow or stalled client does not block other connections.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    app: Router,
+) {
+    use hyper_util::{
+        rt::{TokioExecutor, TokioIo},
+        server::conn::auto::Builder,
+        service::TowerToHyperService,
+    };
+
+    loop {
+        let (tcp_stream, remote_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!("TCP accept error: {}", e);
+                continue;
+            }
+        };
+
+        let acceptor = acceptor.clone();
+        // Clone the Axum Router (it is cheap — backed by Arc).
+        let svc = app.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // TLS handshake failures are expected when misconfigured
+                    // clients connect; log at debug level to avoid noise.
+                    tracing::debug!("TLS handshake failed from {}: {}", remote_addr, e);
+                    return;
+                }
+            };
+            tracing::debug!("TLS connection accepted from {}", remote_addr);
+            let io = TokioIo::new(tls_stream);
+            // Axum's Router implements tower::Service, not hyper::service::Service
+            // directly; adapt it so hyper-util's connection builder can drive it.
+            // Readiness is handled internally per-request via `Oneshot`.
+            let svc = TowerToHyperService::new(svc);
+
+            if let Err(e) = Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await
+            {
+                tracing::debug!("HTTP/TLS connection error from {}: {}", remote_addr, e);
+            }
+        });
+    }
 }

@@ -1,5 +1,7 @@
 # Stellar Poker
 
+See the contribution guide for issue follow-up workflow.
+
 [![CI](https://github.com/Stellar-drive/stellar-drive-stell-poker/actions/workflows/ci.yml/badge.svg)](https://github.com/Stellar-drive/stellar-drive-stell-poker/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -50,6 +52,10 @@ Supports up to 6 players. Includes a solo mode against a deterministic AI oppone
 - **ZK-verified** — Deal, reveal, and showdown proofs are UltraHonk proofs verified onchain via Soroban's native BN254 host functions (Protocol 25).
 - **Trustless settlement** — All bets, pot calculation, and payouts are handled entirely in Soroban smart contracts.
 - **Reusable library** — `stellar-zk-cards` is a standalone Rust crate for card encoding and hand evaluation that any Soroban app can use.
+- **On-chain hand history** — the last 16 settled hands per table are archived in a circular buffer, readable by anyone. See [docs/poker-table-hand-history.md](docs/poker-table-hand-history.md).
+- **Partial buy-ins** — players top their stack up between hands for any amount inside the table's buy-in band, with a configurable per-session rebuy limit. See [docs/poker-table-rebuys.md](docs/poker-table-rebuys.md).
+- **Multi-table play** — a wallet may sit at any number of tables at once; submissions are sequenced per account so parallel actions never collide. See [docs/multi-table-play.md](docs/multi-table-play.md).
+- **Node fee sharing** — rake is split among the active MPC nodes in proportion to stake. See [docs/committee-fee-distribution.md](docs/committee-fee-distribution.md).
 
 ## Contracts on Testnet
 
@@ -104,6 +110,17 @@ stellar-poker/
 - Stellar CLI — `cargo install stellar-cli --features opt`
 - co-noir (for CRS download) — `cargo install --git https://github.com/TaceoLabs/co-snarks co-noir`
 
+New here? [docs/developer-onboarding.md](docs/developer-onboarding.md) is a
+step-by-step checklist from clone to a passing test hand.
+
+Nix users can get the toolchain in one command:
+
+```bash
+nix develop
+```
+
+See [flake.nix](flake.nix).
+
 ## Quick Start
 
 ```bash
@@ -139,11 +156,73 @@ cd app && npm run dev
 python3 scripts/test-flow.py
 ```
 
+## Circuit Benchmarking
+
+The Noir circuits are benchmarked for constraint count, proof size, and proof generation time.
+
+### Constraint Metrics
+
+View circuit constraint counts and proof sizes:
+
+```bash
+# Compile all circuits
+./scripts/compile-circuits.sh
+
+# Display human-readable metrics
+nargo info --program-dir circuits/deal_valid
+nargo info --program-dir circuits/reveal_board_valid
+nargo info --program-dir circuits/showdown_valid
+nargo info --program-dir circuits/muck_valid
+
+# Extract JSON metrics (machine-parseable)
+nargo info --json --program-dir circuits/deal_valid
+```
+
+Backend gate counts (UltraHonk circuit size):
+
+```bash
+bb gates --scheme ultra_honk --bytecode_path circuits/deal_valid/target/deal_valid.json
+```
+
+### Proof Generation Time
+
+Proof generation time is measured for each circuit at varying player counts (2-6 players):
+
+| Circuit          | Players | Proof Time (ms) | Backend Opcodes |
+|------------------|---------|-----------------|-----------------|
+| `deal_valid`     | 2-6     | ~50-60          | 25 117          |
+| `reveal_board_valid` | 2-6 | ~45-55          | 32 792          |
+| `showdown_valid` | 2-6     | ~150-180        | 237 018         |
+| `muck_valid`     | 2-6     | ~40-50          | ~15 000         |
+
+**Hardware Specifications (Benchmark Reference):**
+- CPU: Intel Xeon Platinum 8375C @ 2.90 GHz
+- RAM: 16 GB
+- OS: Ubuntu 22.04.5 LTS (Linux 6.8.0-1014-azure)
+- Noir Version: 1.0.0-beta.17
+- Backend: Barretenberg UltraHonk (BN254 scalar field)
+
+**Note:** Proof generation time varies with hardware, node count, and MPC communication latency. Measurements should be taken on consistent hardware for regression detection. The CI workflow (`.github/workflows/circuit-benchmarks.yml`) automatically validates constraint budgets on every circuit change.
+
 ## Deploy to Testnet
 
 ```bash
 NETWORK=testnet ./scripts/deploy.sh
 ```
+
+## Staging Environment
+
+Staging mirrors production with a dedicated coordinator, three MPC nodes, and a staging frontend, while still settling against **Soroban testnet**.
+
+```bash
+cp .env.staging.example .env.staging
+# fill in staging contracts, keys, identities, and public URLs
+NETWORK=staging OUTPUT_ENV_FILE=.env.staging.deploy ./scripts/deploy.sh
+# copy the generated contract IDs from .env.staging.deploy into .env.staging
+./scripts/deploy-staging.sh
+```
+
+That flow starts the staging services and runs the integration suite against staging before production promotion. The staging runbook lives in [docs/staging-environment.md](docs/staging-environment.md).
 
 ## Deploy to Mainnet
 
@@ -327,3 +406,10 @@ export function CreateTableButton() {
   return <button>Create Solo Table</button>;
 }
 ```
+
+### Documentation & Guides
+
+- [Developer Tutorial: Building Card Games with `stellar-zk-cards`](docs/tutorial-card-game.md)
+- [Noir Testing Guide](docs/NOIR_TESTING_GUIDE.md)
+- [Local Committee Development Guide](docs/local-committee-dev-guide.md)
+- [Soroban Storage Optimization](docs/soroban-storage-optimization.md)

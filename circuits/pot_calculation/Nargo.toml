@@ -1,0 +1,5 @@
+[package]
+name = "pot_calculation"
+type = "bin"
+authors = ["stellar-drive-stell-poker"]
+compiler_version = ">=0.31.0"

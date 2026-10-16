@@ -2,6 +2,16 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import {
+  CHAT_EMOTES,
+  CHAT_MAX_MESSAGE_LENGTH,
+  createChatRateLimiter,
+  isChatEmote,
+  parseIncomingChatFrame,
+  sanitizeChatAlias,
+  sanitizeChatText,
+} from "@/lib/chat-sanitize";
 import { Board } from "./Board";
 import { Card } from "./Card";
 import { PlayerSeat } from "./PlayerSeat";
@@ -16,24 +26,65 @@ import {
   trySilentReconnect,
   getActiveAddress,
   type WalletSession,
-} from "@/lib/freighter";
+} from "@/lib/wallet";
+import { useWalletMonitor } from "@/lib/use-wallet-monitor";
 import { GameBoyButton, GameBoyModal } from "./GameBoyModal";
 import { HandHistoryPanel } from "./HandHistoryPanel";
+import { ProofExplorerPanel } from "./ProofExplorerPanel";
+import { HandReplayer } from "./HandReplayer";
+import { HandTimeline } from "./HandTimeline";
+import { MobileActionBar } from "./MobileActionBar";
+import { TransactionSimulation } from "./TransactionSimulation";
+import { MpcNodeIndicator } from "./MpcNodeIndicator";
+import { SpectatorCount } from "./SpectatorCount";
+import { spectateHref } from "@/lib/spectator";
+import { TableTabs } from "./TableTabs";
+import { ThemeSelector } from "./ThemeSelector";
+import { Skeleton } from "./Skeleton";
+import { TableMiniMap } from "./TableMiniMap";
+import { LanguageSelector } from "./LanguageSelector";
+import { useI18n, useT } from "@/lib/i18n/context";
 import { usePokerActions } from "@/lib/use-poker-actions";
 import { getDealerLine } from "@/lib/dealer-lines";
 import { subscribePokerTableEvents } from "@/lib/events";
 import { getAlias, setAlias } from "@/lib/alias-store";
+import { stellarExpertUrl } from "@/lib/explorer";
 import {
   loadHandHistory,
   saveHandHistoryEntry,
   buildHandRankName,
+  actionsFromTimeline,
   type HandHistoryEntry,
   type Street,
 } from "@/lib/hand-history";
 import {
+  loadStackTrends,
+  recordStacks,
+  saveStackTrends,
+  type StackTrends,
+} from "@/lib/stack-trend";
+import { readTableStakes, saveSeatPreference } from "@/lib/quick-seat";
+import {
   useTurnNotification,
   requestPermissionOnJoin,
 } from "@/lib/use-notifications";
+import {
+  appendEvent,
+  observeEvent,
+  snapshotAt,
+  loadTimeline,
+  saveTimeline,
+  type TimelineEvent,
+  type TimelineStreet,
+} from "@/lib/hand-timeline";
+import { useTutorial } from "@/lib/use-tutorial";
+import { TutorialOverlay, TutorialHelpButton } from "./TutorialOverlay";
+import { EmoteRadialMenu } from "./EmoteRadialMenu";
+import { playSound } from "@/lib/sound-engine";
+import { useAutoRebuy } from "@/lib/use-auto-rebuy";
+import { AutoRebuySettings } from "./AutoRebuySettings";
+import { TurnTimerSettings } from "./TurnTimerSettings";
+import { useTurnTimer } from "@/lib/use-turn-timer";
 
 type ActiveRequest = "deal" | "flop" | "turn" | "river" | "showdown" | null;
 type PlayMode = "single" | "headsup" | "multi";
@@ -89,11 +140,18 @@ function mapOnChainPhase(phase: string): GamePhase | null {
   }
 }
 
+/** Renders Table.
+ * @param props(object) - props(object).
+ */
 export function Table({ tableId, initialPlayMode }: TableProps) {
+  const router = useRouter();
+  const t = useT();
+  const { locale } = useI18n();
   const [game, setGame] = useState<GameState>(() => createInitialState(tableId));
   const [wallet, setWallet] = useState<WalletSession | null>(null);
   const [playMode, setPlayMode] = useState<PlayMode>(initialPlayMode ?? "headsup");
   const [error, setError] = useState<string | null>(null);
+  const [spectatorCount, setSpectatorCount] = useState(0);
   const [walletVerificationError, setWalletVerificationError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [joiningTable, setJoiningTable] = useState(false);
@@ -101,12 +159,29 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
   const [onChainPhase, setOnChainPhase] = useState<string>("unknown");
   const [winnerAddress, setWinnerAddress] = useState<string | null>(null);
   const [lobby, setLobby] = useState<api.TableLobbyResponse | null>(null);
+  const [showSkeleton, setShowSkeleton] = useState<boolean>(true);
   const [botLine, setBotLine] = useState<string | null>(null);
   const [gameboyOpen, setGameboyOpen] = useState(false);
+  const [autoRebuyOpen, setAutoRebuyOpen] = useState(false);
+  const [turnTimerOpen, setTurnTimerOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [proofPanelOpen, setProofPanelOpen] = useState(false);
+  const [loadingSkeletonTest, setLoadingSkeletonTest] = useState(false);
   const [historyEntries, setHistoryEntries] = useState<HandHistoryEntry[]>(() =>
     loadHandHistory(tableId)
   );
+  // Hand chosen for step-through replay from the history panel (#62). The
+  // replayer and the panel's `onReplay` callback were both wired up already,
+  // but the state connecting them was missing, which broke the type-check.
+  const [replayEntry, setReplayEntry] = useState<HandHistoryEntry | null>(null);
+  // Each seat's settled stack over recent hands, for the sparklines (#157).
+  const [stackTrends, setStackTrends] = useState<StackTrends>(() =>
+    loadStackTrends(tableId)
+  );
+  // Live hand timeline (#176): every moment of the hand in progress, plus the
+  // moment currently being reviewed (null while pinned to live).
+  const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
+  const [scrubIndex, setScrubIndex] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [, bumpAliasTick] = useState(0);
   const [betAmount, setBetAmount] = useState(0);
@@ -114,12 +189,15 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<Array<{ alias: string; text: string; senderColor: string }>>([]);
+  const [chatNotice, setChatNotice] = useState<string | null>(null);
+  const chatRateLimiterRef = useRef(createChatRateLimiter());
   const [newMessagesCount, setNewMessagesCount] = useState(0);
   const [seatEmotes, setSeatEmotes] = useState<Record<number, string>>({});
   const wsRef = useRef<WebSocket | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const autoStreetRef = useRef<string>("");
   const inferredModeRef = useRef(false);
+  const seatPreferenceRef = useRef<string | null>(null);
   const streetLogRef = useRef<{ handNumber: number; streets: { street: Street; pot: number; boardCards: number[] }[] }>({
     handNumber: 0,
     streets: [],
@@ -138,8 +216,126 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     : onChainTurnAddress;
   const isMyTurn = !!userAddress && displayedTurnAddress === userAddress;
 
+  // Issue #164: check the player's auto-rebuy preference whenever the table
+  // settles into "waiting" between hands, and submit an on-chain rebuy if
+  // their configured rule triggers.
+  useAutoRebuy({
+    tableId,
+    wallet,
+    phase: game.phase,
+    currentStack: userPlayer?.stack ?? 0,
+  });
+
   // Issue #47: browser notification + sound when it becomes the user's turn.
   useTurnNotification({ isMyTurn, tableName: `Table #${tableId}` });
+
+  // Issue #154: per-turn countdown. The hook computes everything and on
+  // timeout we dispatch the configured auto-action (fold / check-if-possible).
+  const userCallAmount = userPlayer
+    ? Math.max(
+        Math.max(...game.players.map((p) => p.betThisRound), 0) - userPlayer.betThisRound,
+        0
+      )
+    : 0;
+  const turnTimer = useTurnTimer(
+    {
+      tableId,
+      address: userAddress ?? "",
+      turnAddress: displayedTurnAddress,
+      phase: game.phase,
+      handNumber: game.handNumber,
+      callAmount: userCallAmount,
+    },
+    (action) => {
+      if (loading) return;
+      if (action === "check") {
+        const liveCall =
+          userPlayer
+            ? Math.max(
+                Math.max(...game.players.map((p) => p.betThisRound), 0) -
+                  userPlayer.betThisRound,
+                0
+              )
+            : 0;
+        if (liveCall <= 0) {
+          void handleAction("check");
+        } else {
+          void handleAction("fold");
+        }
+      } else {
+        void handleAction("fold");
+      }
+    }
+  );
+
+  // Shared table turn-clock: tracks remaining seconds for whoever is currently
+  // acting. This shows up on opponent seats too, not just the user's.
+  const sharedTimerDuration = turnTimer.durationSeconds;
+  const [sharedTimeLeft, setSharedTimeLeft] = useState(sharedTimerDuration);
+  const sharedTurnKey = `${game.handNumber ?? 0}|${game.phase}|${displayedTurnAddress ?? ""}|${sharedTimerDuration}`;
+  const sharedTurnActive =
+    !!displayedTurnAddress && ["preflop", "flop", "turn", "river"].includes(game.phase);
+  useEffect(() => {
+    if (!sharedTurnActive) {
+      setSharedTimeLeft(sharedTimerDuration);
+      return;
+    }
+    setSharedTimeLeft(sharedTimerDuration);
+    const started = Date.now();
+    const id = window.setInterval(() => {
+      const left = sharedTimerDuration - Math.floor((Date.now() - started) / 1000);
+      if (left <= 0) {
+        setSharedTimeLeft(0);
+        window.clearInterval(id);
+        return;
+      }
+      setSharedTimeLeft(left);
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [sharedTurnKey, sharedTurnActive, sharedTimerDuration]);
+  const sharedTimerUrgent =
+    sharedTurnActive && sharedTimerDuration > 0 && sharedTimeLeft / sharedTimerDuration <= 0.2;
+
+  // Issue #61: tutorial overlay for new players.
+  const tutorial = useTutorial();
+
+  // Issue #63: sound effects
+  // Ref to track the previous phase so we only fire on transitions.
+  const prevPhaseRef = useRef<string>("");
+  const prevBoardCountRef = useRef<number>(0);
+  const prevWinnerRef = useRef<string | null>(null);
+
+  // Card shuffle when deal starts (waiting → preflop)
+  useEffect(() => {
+    const phase = game.phase;
+    if (prevPhaseRef.current !== phase) {
+      if (phase === "preflop" && prevPhaseRef.current === "waiting") {
+        void playSound("shuffle");
+      }
+      prevPhaseRef.current = phase;
+    }
+  }, [game.phase]);
+
+  // Card flip when community cards are revealed (board grows)
+  useEffect(() => {
+    const count = game.boardCards.length;
+    if (count > prevBoardCountRef.current) {
+      // Stagger one flip sound per new card
+      const newCards = count - prevBoardCountRef.current;
+      for (let i = 0; i < newCards; i++) {
+        setTimeout(() => void playSound("flip"), i * 110);
+      }
+    }
+    prevBoardCountRef.current = count;
+  }, [game.boardCards.length]);
+
+  // Winner celebration when a winner is determined
+  useEffect(() => {
+    if (winnerAddress && winnerAddress !== prevWinnerRef.current) {
+      void playSound("winner");
+    }
+    prevWinnerRef.current = winnerAddress;
+  }, [winnerAddress]);
 
   const isWalletSeated = !!wallet && !!userPlayer;
   const seatedAddresses = game.players
@@ -161,6 +357,9 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
       if (lobbyState) {
         setLobby(lobbyState);
       }
+
+      // Hide skeleton after first successful sync
+      setShowSkeleton(false);
 
       const phaseRaw = typeof parsed.phase === "string" ? parsed.phase : null;
       if (phaseRaw) {
@@ -274,6 +473,9 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     handleReveal,
     handleShowdown,
     handleAction,
+    joinSimulation,
+    actionSimulation,
+    pendingAction,
   } = usePokerActions({
     tableId,
     wallet,
@@ -295,27 +497,46 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     void syncOnChainState();
 
     // Event-driven refresh: subscribe to the poker table contract's events and
-    // re-sync immediately whenever a state transition is emitted. A slower
-    // interval remains as a safety net in case an event is missed.
-    let unsubscribe: (() => void) | undefined;
+    // re-sync immediately whenever a state transition is emitted.
+    let unsubscribeChainEvents: (() => void) | undefined;
     void subscribePokerTableEvents(() => {
       void syncOnChainState();
     })
       .then((sub) => {
-        unsubscribe = sub.stop;
+        unsubscribeChainEvents = sub.stop;
       })
       .catch(() => {
         // Event subscription unavailable — fall back to interval polling only.
       });
 
+    // Coordinator WebSocket push (Issue #105): the coordinator notifies us
+    // the instant a deal/reveal/showdown/player action lands, so we don't
+    // have to wait on the slower interval below. `subscribeGameState`
+    // returns null on browsers without WebSocket support, in which case the
+    // interval poll is the only refresh mechanism.
+    const gameStateSocket = api.subscribeGameState(tableId, (msg) => {
+      // Spectator join/leave frames (Issue #171) only update the indicator.
+      if (api.isSpectatorCountEvent(msg)) {
+        setSpectatorCount(msg.spectator_count);
+        return;
+      }
+      if (typeof msg.spectator_count === "number") {
+        setSpectatorCount(msg.spectator_count);
+      }
+      void syncOnChainState();
+    });
+
+    // Safety net in case a chain event or WebSocket push is missed or the
+    // browser has no WebSocket support at all.
     const interval = setInterval(() => {
       void syncOnChainState();
     }, 8000);
     return () => {
       clearInterval(interval);
-      unsubscribe?.();
+      unsubscribeChainEvents?.();
+      gameStateSocket?.stop();
     };
-  }, [syncOnChainState]);
+  }, [syncOnChainState, tableId]);
 
   // Infer sensible default play mode from table capacity when no explicit mode was provided.
   useEffect(() => {
@@ -405,6 +626,16 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     };
   }, [wallet]);
 
+  // Auto-logout when wallet disconnects (#322).
+  useWalletMonitor({
+    wallet,
+    onDisconnect: () => {
+      setWallet(null);
+      setGame(createInitialState(tableId));
+      router.push("/");
+    },
+  });
+
   // Elapsed timer while loading
   useEffect(() => {
     if (loading) {
@@ -452,16 +683,120 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
         handRankName: buildHandRankName(userPlayer?.cards, game.boardCards),
         winnerAddress,
         txHash: game.lastTxHash,
+        // Who was dealt in and how the betting went, for the export (#158).
+        heroAddress: userAddress,
+        players: game.players.map(({ address, seat }) => ({ address, seat })),
+        actions: actionsFromTimeline(game.handNumber, timeline),
       };
       saveHandHistoryEntry(entry);
       setHistoryEntries(loadHandHistory(tableId));
       streetLogRef.current = { handNumber: game.handNumber, streets: [] };
     }
-  }, [game.phase, game.handNumber, game.pot, game.boardCards, game.lastTxHash, tableId, userPlayer, winnerAddress]);
+  }, [game.phase, game.handNumber, game.pot, game.boardCards, game.lastTxHash, game.players, tableId, timeline, userAddress, userPlayer, winnerAddress]);
+
+  // Chip stack trend per seat (#157). Stacks are only recorded between hands,
+  // once the pot has been paid out, so each point is where a player's stack
+  // settled after a hand rather than wherever it stood mid-bet.
+  useEffect(() => {
+    if (game.phase !== "waiting" && game.phase !== "settlement") return;
+    setStackTrends((previous) => {
+      const next = recordStacks(previous, game.handNumber, game.players);
+      if (next !== previous) {
+        saveStackTrends(tableId, next);
+      }
+      return next;
+    });
+  }, [game.phase, game.handNumber, game.players, tableId]);
+
+  // Quick seat (#159): remember the table size, stakes and seat the player is
+  // sitting in, so the lobby can seat them somewhere similar next time.
+  useEffect(() => {
+    if (!userAddress || !userPlayer || !lobby || playMode === "single") return;
+    const key = `${userAddress}:${tableId}`;
+    if (seatPreferenceRef.current === key) return;
+    seatPreferenceRef.current = key;
+
+    const { max_players: maxPlayers } = lobby;
+    const seatIndex = userPlayer.seat;
+    api
+      .getParsedTableState(tableId)
+      .then(({ parsed }) => {
+        const stakes = readTableStakes(parsed);
+        if (!stakes) return;
+        saveSeatPreference(userAddress, {
+          maxPlayers,
+          buyIn: stakes.buyIn.toString(),
+          token: stakes.token,
+          seatIndex,
+        });
+      })
+      .catch(() => {
+        // Non-fatal: quick seat keeps whatever it remembered before.
+      });
+  }, [lobby, playMode, tableId, userAddress, userPlayer]);
+
+  // ── Live hand timeline (#176) ──────────────────────────────────────────────
+  // Every state sync is an observation; `observeEvent` decides whether this
+  // one is a moment worth a marker, and `appendEvent` makes recording it
+  // idempotent — which matters because the table re-syncs from a chain
+  // subscription, a WebSocket push, and an interval poll all at once.
+  useEffect(() => {
+    if (game.handNumber === 0) return;
+
+    setTimeline((previous) => {
+      // A new hand starts a fresh timeline, restoring anything a reload
+      // mid-hand left behind.
+      const base =
+        previous.length > 0 && previous[0].id.startsWith(`${game.handNumber}:`)
+          ? previous
+          : loadTimeline(tableId, game.handNumber);
+
+      const observed = observeEvent(
+        {
+          handNumber: game.handNumber,
+          phase: game.phase as TimelineStreet,
+          pot: game.pot,
+          boardCards: game.boardCards,
+          turnAddress: displayedTurnAddress,
+        },
+        base[base.length - 1],
+        Date.now()
+      );
+
+      const next = observed ? appendEvent(base, observed) : base;
+      if (next !== previous) {
+        saveTimeline(tableId, game.handNumber, next);
+      }
+      return next;
+    });
+  }, [
+    game.handNumber,
+    game.phase,
+    game.pot,
+    game.boardCards,
+    displayedTurnAddress,
+    tableId,
+  ]);
+
+  // A new moment while reviewing must not yank the player back to live, but a
+  // new hand should — the old hand's timeline is gone.
+  useEffect(() => {
+    setScrubIndex(null);
+  }, [game.handNumber]);
+
+  const liveIndex = Math.max(0, timeline.length - 1);
+  const timelineIndex = scrubIndex ?? liveIndex;
+  const reviewing = scrubIndex !== null && scrubIndex !== liveIndex;
+  const reviewedMoment = reviewing ? snapshotAt(timeline, timelineIndex) : null;
 
   const currentBet = Math.max(...game.players.map((p) => p.betThisRound), 0);
   const displayCurrentBet = currentBet;
-  const displayPot = game.pot;
+  // While a past moment is selected the felt shows that moment's board and pot
+  // instead of the live ones; every control stays bound to the live state.
+  const displayPot = reviewedMoment ? reviewedMoment.pot : game.pot;
+  const displayBoardCards = reviewedMoment
+    ? reviewedMoment.boardCards
+    : game.boardCards;
   const displayMyBet = userPlayer?.betThisRound || 0;
   const displayMyStack = userPlayer?.stack || 0;
   const canStartHand = !!wallet && isWalletSeated;
@@ -526,6 +861,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     winnerAddress,
     userAddress,
     lobby,
+    locale,
   });
 
   // Keyboard shortcuts listener
@@ -624,7 +960,8 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     handleAction,
   ]);
 
-  const EMOTES = ["😃", "😢", "😠", "😎", "🤔", "🎉"];
+  const [emoteRadialOpen, setEmoteRadialOpen] = useState(false);
+  const EMOTES = CHAT_EMOTES;
 
   useEffect(() => {
     if (chatScrollRef.current) {
@@ -639,46 +976,36 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
 
     const connect = () => {
       if (!active) return;
-      const base = api.COORDINATOR_API_BASE;
-      const wsBase = base.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
-      const wsUrl = `${wsBase}/api/table/${tableId}/chat/ws`;
+      const wsUrl = `${api.coordinatorWsBase()}/api/table/${tableId}/chat/ws`;
 
       ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data) as {
-            seat_index: number;
-            alias: string;
-            text?: string;
-            emote?: string;
-          };
+        // Untrusted input: validated and reduced to plain text (Issue #140).
+        const frame = parseIncomingChatFrame(event.data);
+        if (!frame) return;
 
-          if (data.text) {
-            const colors = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#cc5de8", "#20c997"];
-            const senderColor = colors[data.seat_index % colors.length];
-            setChatMessages((prev) => [
-              ...prev,
-              { alias: data.alias, text: data.text || "", senderColor },
-            ]);
-            if (!chatOpen) {
-              setNewMessagesCount((c) => c + 1);
-            }
+        if (frame.text) {
+          const colors = ["#ff6b6b", "#4dabf7", "#51cf66", "#fcc419", "#cc5de8", "#20c997"];
+          const senderColor = colors[frame.seatIndex % colors.length];
+          const text = frame.text;
+          setChatMessages((prev) => [...prev, { alias: frame.alias, text, senderColor }]);
+          if (!chatOpen) {
+            setNewMessagesCount((c) => c + 1);
           }
+        }
 
-          if (data.emote) {
-            setSeatEmotes((prev) => ({ ...prev, [data.seat_index]: data.emote || "" }));
-            setTimeout(() => {
-              setSeatEmotes((prev) => {
-                const copy = { ...prev };
-                delete copy[data.seat_index];
-                return copy;
-              });
-            }, 3000);
-          }
-        } catch {
-          // Ignore parse errors
+        if (frame.emote) {
+          const emote = frame.emote;
+          setSeatEmotes((prev) => ({ ...prev, [frame.seatIndex]: emote }));
+          setTimeout(() => {
+            setSeatEmotes((prev) => {
+              const copy = { ...prev };
+              delete copy[frame.seatIndex];
+              return copy;
+            });
+          }, 3000);
         }
       };
 
@@ -698,23 +1025,29 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     return () => {
       active = false;
       clearTimeout(reconnectTimeout);
-      ws?.close();
+      if (ws) ws.close();
     };
   }, [tableId, chatOpen]);
 
   const sendChatMessage = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!chatInput.trim() || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+    const text = sanitizeChatText(chatInput);
+    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       return;
     }
+    if (!chatRateLimiterRef.current.tryConsume()) {
+      setChatNotice("Slow down — too many messages.");
+      return;
+    }
+    setChatNotice(null);
 
     const mySeat = userPlayer ? userPlayer.seat : 0;
-    const myAlias = userAddress ? (getAlias(userAddress) || `Seat ${mySeat}`) : `Seat ${mySeat}`;
+    const myAlias = sanitizeChatAlias(userAddress ? getAlias(userAddress) : "", mySeat);
 
     const payload = {
       seat_index: mySeat,
       alias: myAlias,
-      text: chatInput.trim(),
+      text,
     };
 
     wsRef.current.send(JSON.stringify(payload));
@@ -722,28 +1055,63 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
   };
 
   const sendEmote = (emote: string) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+    if (!isChatEmote(emote)) return;
+    if (!chatRateLimiterRef.current.tryConsume()) {
+      setChatNotice("Slow down — too many messages.");
       return;
     }
-
     const mySeat = userPlayer ? userPlayer.seat : 0;
-    const myAlias = userAddress ? (getAlias(userAddress) || `Seat ${mySeat}`) : `Seat ${mySeat}`;
+    const myAlias = sanitizeChatAlias(userAddress ? getAlias(userAddress) : "", mySeat);
 
-    const payload = {
-      seat_index: mySeat,
-      alias: myAlias,
-      emote,
-    };
+    setSeatEmotes((prev) => ({ ...prev, [mySeat]: emote }));
+    setTimeout(() => {
+      setSeatEmotes((prev) => {
+        const copy = { ...prev };
+        delete copy[mySeat];
+        return copy;
+      });
+    }, 3000);
 
-    wsRef.current.send(JSON.stringify(payload));
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      const payload = {
+        seat_index: mySeat,
+        alias: myAlias,
+        emote,
+      };
+      wsRef.current.send(JSON.stringify(payload));
+    }
   };
 
   return (
     <PixelWorld>
-      <div className="min-h-screen flex flex-col items-center gap-4 p-4 pt-6 relative z-[10]">
+      <div className="min-h-screen flex flex-col items-center gap-4 p-2 sm:p-4 pt-4 sm:pt-6 relative z-[10]">
+        {/* Switcher for a player sitting at several tables at once (#72) */}
+        {showSkeleton ? (
+          <div className="w-full max-w-3xl p-6">
+            <div className="flex gap-4">
+              <div style={{ width: 220 }}>
+                <Skeleton height="18px" className="mb-3" />
+                <Skeleton height="140px" className="mb-2" />
+                <div className="flex gap-2 mt-2"><Skeleton width="60px" height="24px" /><Skeleton width="60px" height="24px" /></div>
+              </div>
+              <div style={{ flex: 1 }}>
+                <Skeleton height="18px" className="mb-3" />
+                <Skeleton height="220px" className="mb-4" />
+                <div className="grid grid-cols-3 gap-2"><Skeleton height="40px" /><Skeleton height="40px" /><Skeleton height="40px" /></div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <TableTabs
+            activeTableId={tableId}
+            activeMode={playMode}
+            address={userAddress ?? null}
+          />
+        )}
+
         {/* Header bar */}
-        <div className="w-full max-w-3xl flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        <div className="table-header w-full max-w-3xl flex items-center justify-between flex-wrap gap-2">
+          <div className="nav-links flex items-center gap-2 sm:gap-3 flex-wrap">
             <Link
               href="/"
               className="text-[24px]"
@@ -763,7 +1131,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                 textShadow: "2px 2px 0 #2c3e50",
               }}
             >
-              TABLE #{tableId}
+              {t("table.title", { id: tableId })}
             </h1>
             <GameBoyButton onClick={() => setGameboyOpen(true)} />
             <button
@@ -779,8 +1147,58 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
               }}
               title="Hand History"
             >
-              HISTORY
+              {t("nav.history")}
             </button>
+            <button
+              onClick={() => setProofPanelOpen((open) => !open)}
+              className="text-[9px] mr-2"
+              style={{
+                background: "none",
+                border: "none",
+                color: "#c8e6ff",
+                textDecoration: "underline",
+                cursor: "pointer",
+                padding: 0,
+              }}
+              title="ZK Proof Explorer"
+              aria-pressed={proofPanelOpen}
+            >
+              PROOFS
+            </button>
+            {userAddress && (
+              <button
+                onClick={() => setAutoRebuyOpen(true)}
+                className="text-[9px] mr-2"
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "#c8e6ff",
+                  textDecoration: "underline",
+                  cursor: "pointer",
+                  padding: 0,
+                }}
+                title="Auto-Rebuy Settings"
+              >
+                AUTO-REBUY
+              </button>
+            )}
+            {userAddress && (
+              <button
+                onClick={() => setTurnTimerOpen(true)}
+                className="text-[9px] mr-2"
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "#ffd43b",
+                  textDecoration: "underline",
+                  cursor: "pointer",
+                  padding: 0,
+                }}
+                title="Turn Timer Settings"
+              >
+                TIMER
+              </button>
+            )}
             <button
               onClick={() => setShortcutsOpen(true)}
               className="text-[9px]"
@@ -794,20 +1212,33 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
               }}
               title="Keyboard Shortcuts"
             >
-              KEYS [?]
+              {t("nav.keys")}
             </button>
+            <TutorialHelpButton onClick={tutorial.open} />
+            <ThemeSelector />
+            <LanguageSelector variant="header" />
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="table-header-right flex items-center gap-2 sm:gap-3">
+            <a
+              href={spectateHref(tableId)}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Open an anonymous spectator view of this table"
+              className="no-underline"
+            >
+              <SpectatorCount count={spectatorCount} />
+            </a>
             <div className="text-[9px]" style={{ color: "#c8e6ff" }}>
-              HAND #{game.handNumber} | {game.phase.toUpperCase()}
+              {t("table.hand", { n: game.handNumber })} | {game.phase.toUpperCase()}
             </div>
+            <MpcNodeIndicator tableId={tableId} phase={game.phase} />
 
             {(() => {
               const explorerUrl = game.lastTxHash
-                ? `https://stellar.expert/explorer/testnet/tx/${game.lastTxHash}`
+                ? stellarExpertUrl("tx", game.lastTxHash)
                 : wallet
-                  ? `https://stellar.expert/explorer/testnet/account/${wallet.address}`
+                  ? stellarExpertUrl("account", wallet.address)
                   : null;
               if (!explorerUrl) return null;
               return (
@@ -822,7 +1253,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                     textShadow: "1px 1px 0 rgba(0,0,0,0.5)",
                   }}
                 >
-                  {game.lastTxHash ? "VIEW TX ↗" : "EXPLORER ↗"}
+                  {game.lastTxHash ? t("table.viewTx") : t("table.explorer")}
                 </a>
               );
             })()}
@@ -845,7 +1276,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
 
         {/* Dealer line */}
         <div
-          className="w-full max-w-3xl pixel-border-thin px-4 py-2"
+          className="dealer-line w-full max-w-3xl pixel-border-thin px-3 sm:px-4 py-2"
           style={{
             background: loading
               ? "rgba(40, 20, 8, 0.9)"
@@ -907,9 +1338,9 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
         )}
 
         {/* ═══ THE POKER TABLE ═══ */}
-        <div className="w-full max-w-3xl relative" style={{ minHeight: "400px" }}>
+        <div className="table-container w-full max-w-3xl relative" style={{ minHeight: "400px" }}>
           <div
-            className="pixel-border relative w-full flex flex-col items-center justify-center gap-4"
+            className="table-felt pixel-border relative w-full flex flex-col items-center justify-center gap-4"
             style={{
               background:
                 "radial-gradient(ellipse at center, var(--felt-light) 0%, var(--felt-mid) 40%, var(--felt-dark) 100%)",
@@ -928,7 +1359,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
             />
 
             {/* ── OPPONENTS (top) ── */}
-            <div className="flex flex-wrap gap-6 items-end justify-center">
+            <div className="opponents-row flex flex-wrap gap-4 sm:gap-6 items-end justify-center">
               {game.players
                 .filter((p) => !userAddress || p.address !== userAddress)
                 .map((player) => (
@@ -943,6 +1374,13 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                     alias={getAlias(player.address) ?? undefined}
                     hideChipStats={false}
                     activeEmote={seatEmotes[player.seat]}
+                    boardCards={game.boardCards}
+                    gamePhase={game.phase}
+                    showStatsTooltip={playMode !== "single"}
+                    stackTrend={stackTrends[player.address]?.map((p) => p.stack)}
+                    turnTimerSecondsLeft={displayedTurnAddress === player.address ? sharedTimeLeft : 0}
+                    turnTimerDurationSeconds={displayedTurnAddress === player.address ? sharedTimerDuration : 0}
+                    turnTimerUrgent={displayedTurnAddress === player.address ? sharedTimerUrgent : false}
                   />
                 ))}
 
@@ -973,7 +1411,9 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
               borderBottom: '2px solid rgba(139, 105, 20, 0.2)',
               padding: '12px 0',
             }}>
-              <Board cards={game.boardCards} pot={displayPot} />
+              <div className={reviewing ? "timeline-reviewing" : undefined}>
+                <Board cards={displayBoardCards} pot={displayPot} />
+              </div>
 
               {game.phase === "waiting" && wallet && !isWalletSeated && playMode !== "single" && (
                 <button
@@ -993,7 +1433,14 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                   currentBet={displayCurrentBet}
                   myBet={displayMyBet}
                   myStack={displayMyStack}
-                  onAction={handleAction}
+                  pot={displayPot}
+                  onAction={(action, amount) => {
+                    // Issue #63: chip sound on bet/raise/call/allin
+                    if (["bet", "raise", "call", "allin"].includes(action)) {
+                      void playSound("chip");
+                    }
+                    return handleAction(action, amount);
+                  }}
                   onChainConfirmed={game.onChainConfirmed}
                   canStartHand={canStartHand}
                   canResolveShowdown={!!wallet}
@@ -1007,7 +1454,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
             </div>
 
             {/* ── YOU (bottom) ── */}
-            <div className="flex gap-4 items-start">
+            <div className="user-seat-row flex gap-4 items-start justify-center">
               {userPlayer ? (
                 <PlayerSeat
                   player={userPlayer}
@@ -1028,6 +1475,12 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                   }}
                   hideChipStats={false}
                   activeEmote={seatEmotes[userPlayer.seat]}
+                  boardCards={game.boardCards}
+                  gamePhase={game.phase}
+                  stackTrend={stackTrends[userPlayer.address]?.map((p) => p.stack)}
+                  turnTimerSecondsLeft={turnTimer.isActive ? turnTimer.timeLeftSeconds : 0}
+                  turnTimerDurationSeconds={turnTimer.durationSeconds}
+                  turnTimerUrgent={turnTimer.isUrgent}
                 />
               ) : (
                 <div className="flex flex-col items-center gap-2" style={{ opacity: 0.25 }}>
@@ -1037,7 +1490,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                     <Card faceDown size="md" />
                   </div>
                   <div className="text-[9px]" style={{ color: 'rgba(255,255,255,0.3)' }}>
-                    {wallet ? "WAITING TO JOIN..." : "CONNECT WALLET"}
+                    {wallet ? t("table.waitingToJoin") : t("table.connectWallet")}
                   </div>
                 </div>
               )}
@@ -1045,8 +1498,18 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
           </div>
         </div>
 
+        {/* Live hand timeline — step back through this hand without leaving
+            the table, for catching up after a disconnect (#176). */}
+        <HandTimeline
+          events={timeline}
+          index={timelineIndex}
+          onSeek={(index) => setScrubIndex(index)}
+          isLive={!reviewing}
+          onReturnToLive={() => setScrubIndex(null)}
+        />
+
         {/* MPC Status footer */}
-        <div className="flex flex-col items-center gap-1 mt-2">
+        <div className="mpc-footer flex flex-col items-center gap-1 mt-2">
           <div className="flex items-center gap-2">
             <div
               style={{
@@ -1057,7 +1520,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
               }}
             />
             <span className="text-[8px]" style={{ color: "#7f8c8d" }}>
-              MPC: 3/3 NODES | TACEO CO-NOIR REP3
+              {t("table.mpcStatus")}
             </span>
           </div>
           {game.lastTxHash && (
@@ -1070,7 +1533,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
               <span className="text-[8px]" style={{ color: "#7f8c8d" }}>
                 TX:{" "}
                 <a
-                  href={`https://stellar.expert/explorer/testnet/tx/${game.lastTxHash}`}
+                  href={stellarExpertUrl("tx", game.lastTxHash)}
                   target="_blank"
                   rel="noopener noreferrer"
                   style={{ color: "#ffc078", textShadow: "1px 1px 0 rgba(0,0,0,0.5)" }}
@@ -1082,13 +1545,33 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
           )}
         </div>
 
-        <div className="fixed bottom-0 left-[5%] z-[5]" style={{ transform: 'translateY(15%)' }}>
+        <div className="deco-cat fixed bottom-0 left-[5%] z-[5]" style={{ transform: 'translateY(15%)' }}>
           <PixelCat sprite={17} size={36} />
         </div>
-        <div className="fixed bottom-0 right-[5%] z-[5]" style={{ transform: 'translateY(10%)' }}>
+        <div className="deco-cat fixed bottom-0 right-[5%] z-[5]" style={{ transform: 'translateY(10%)' }}>
           <PixelCat sprite={21} size={48} flipped />
         </div>
       </div>
+
+      {/* Sticky bottom action bar for phones (#175). Hidden by CSS above the
+          mobile breakpoint, where the full action panel is in play instead. */}
+      <MobileActionBar
+        visible={["preflop", "flop", "turn", "river"].includes(game.phase)}
+        isMyTurn={isMyTurn}
+        currentBet={displayCurrentBet}
+        myBet={displayMyBet}
+        myStack={displayMyStack}
+        pot={game.pot}
+        loading={loading}
+        betAmount={betAmount}
+        setBetAmount={setBetAmount}
+        onAction={(action, amount) => {
+          if (["bet", "raise", "call", "allin"].includes(action)) {
+            void playSound("chip");
+          }
+          return handleAction(action, amount);
+        }}
+      />
 
       <GameBoyModal
         open={gameboyOpen}
@@ -1100,7 +1583,26 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
         open={historyOpen}
         onClose={() => setHistoryOpen(false)}
         entries={historyEntries}
+        onReplay={(entry) => setReplayEntry(entry)}
       />
+
+      {/* Issue #160: proof explorer side panel (bottom sheet on mobile) */}
+      <ProofExplorerPanel
+        open={proofPanelOpen}
+        onClose={() => setProofPanelOpen(false)}
+      />
+
+      {userAddress && (
+        <AutoRebuySettings
+          open={autoRebuyOpen}
+          onClose={() => setAutoRebuyOpen(false)}
+          tableId={tableId}
+          address={userAddress}
+        />
+      )}
+
+      {/* Issue #53 — collapsible multi-table overview */}
+      <TableMiniMap currentTableId={tableId} defaultCollapsed />
 
       {shortcutsOpen && (
         <div
@@ -1147,13 +1649,31 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
         </div>
       )}
 
+      {/* Emote Radial Menu Toggle Button */}
+      <button
+        type="button"
+        onClick={() => setEmoteRadialOpen((prev) => !prev)}
+        className="emote-toggle-btn pixel-btn pixel-btn-yellow text-[9px] fixed bottom-4 right-28 z-40 flex items-center gap-1"
+        style={{ padding: "8px 12px" }}
+        title="Open Emote Radial Menu"
+      >
+        <span>💬</span> EMOTE
+      </button>
+
+      {/* Emote Radial Menu */}
+      <EmoteRadialMenu
+        isOpen={emoteRadialOpen}
+        onClose={() => setEmoteRadialOpen(false)}
+        onSelectEmote={(emoteText) => sendEmote(emoteText)}
+      />
+
       {/* Chat Overlay Toggle Button */}
       <button
         onClick={() => {
           setChatOpen((prev) => !prev);
           setNewMessagesCount(0);
         }}
-        className="pixel-btn pixel-btn-blue text-[9px] fixed bottom-4 right-4 z-40"
+        className="chat-toggle-btn pixel-btn pixel-btn-blue text-[9px] fixed bottom-4 right-4 z-40"
         style={{ padding: "8px 12px" }}
       >
         CHAT {newMessagesCount > 0 ? `(${newMessagesCount})` : ""}
@@ -1162,7 +1682,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
       {/* Floating Chat Drawer */}
       {chatOpen && (
         <div
-          className="pixel-border-thin fixed bottom-16 right-4 z-40 flex flex-col w-72 h-64 p-3 gap-2"
+          className="chat-drawer pixel-border-thin fixed bottom-16 right-4 z-40 flex flex-col w-72 h-64 p-3 gap-2"
           style={{
             background: "rgba(20, 12, 8, 0.95)",
             borderColor: "var(--ui-border)",
@@ -1188,6 +1708,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
             {chatMessages.length === 0 ? (
               <div className="text-gray-600 text-center mt-8 italic" style={{ fontSize: "8px" }}>No messages yet.</div>
             ) : (
+              // Rendered as React text nodes only — never dangerouslySetInnerHTML (#140).
               chatMessages.map((msg, idx) => (
                 <div key={idx} className="leading-relaxed">
                   <span style={{ color: msg.senderColor }}>{msg.alias}: </span>
@@ -1211,11 +1732,18 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
             ))}
           </div>
           
+          {chatNotice && (
+            <div className="text-[#ff6b6b] text-[7px]" role="status">
+              {chatNotice}
+            </div>
+          )}
+
           {/* Input row */}
           <form onSubmit={sendChatMessage} className="flex gap-1 mt-1">
             <input
               type="text"
               value={chatInput}
+              maxLength={CHAT_MAX_MESSAGE_LENGTH}
               onChange={(e) => setChatInput(e.target.value)}
               placeholder="Say something..."
               className="flex-1 px-2 py-1 text-[8px]"
@@ -1281,6 +1809,58 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
           </div>
         </div>
       )}
+
+      {/* Transaction Simulations */}
+      {joinSimulation.showSimulation && joinSimulation.simulation && (
+        <TransactionSimulation
+          simulation={joinSimulation.simulation}
+          loading={joinSimulation.loading}
+          buyInAmount={joinSimulation.params?.buyIn}
+          onConfirm={() => {
+            joinSimulation.confirmJoin();
+          }}
+          onCancel={() => {
+            joinSimulation.cancelSimulation();
+          }}
+        />
+      )}
+
+      {actionSimulation.showSimulation && actionSimulation.simulation && pendingAction && (
+        <TransactionSimulation
+          simulation={actionSimulation.simulation}
+          loading={actionSimulation.loading}
+          onConfirm={() => {
+            actionSimulation.confirmAction(
+              tableId, 
+              pendingAction.action, 
+              pendingAction.amount
+            );
+          }}
+          onCancel={() => {
+            actionSimulation.cancelSimulation();
+          }}
+        />
+      )}
+
+      {/* Issue #62: Hand replayer */}
+      <HandReplayer
+        entry={replayEntry}
+        onClose={() => setReplayEntry(null)}
+      />
+
+      {/* Issue #61: Tutorial overlay */}
+      <TutorialOverlay
+        isOpen={tutorial.isOpen}
+        currentStep={tutorial.currentStep}
+        currentIndex={tutorial.currentIndex}
+        totalSteps={tutorial.totalSteps}
+        isLastStep={tutorial.isLastStep}
+        isFirstStep={tutorial.isFirstStep}
+        onClose={tutorial.close}
+        onNext={tutorial.next}
+        onPrev={tutorial.prev}
+        onGoTo={tutorial.goTo}
+      />
     </PixelWorld>
   );
 }

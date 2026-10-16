@@ -1,35 +1,141 @@
 //! REST API handlers for the coordinator service.
 
-mod auth;
 pub mod admin;
-mod parsing;
-mod session;
+mod admin_extended;
+pub mod api_key_admin;
+mod auth;
+pub mod csp;
 pub mod flags;
+mod parsing;
+pub mod plugins;
+mod session;
+pub mod tournament_api;
 pub mod types;
 
+pub use admin_extended::*;
 pub use types::*;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde::Serialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::{feature_flags, mpc, session_gc, soroban, AppState, TableSession};
+use crate::{
+    anti_dumping, circuit_pins, feature_flags, mpc, mpc_validation, rate_limit, session_cache,
+    session_gc, session_recovery, soroban, AppState, TableSession,
+};
 use auth::{allow_insecure_dev_auth, enforce_rate_limit, validate_signed_request};
 use parsing::{
     parse_deal_outputs, parse_requested_buy_in, parse_reveal_outputs, parse_showdown_outputs,
 };
 use session::{
-    ensure_session_exists, fetch_onchain_table_view, is_identity_missing_error,
-    next_proof_session_id, resolve_deal_players_from_lobby, validate_players,
-    validate_reveal_phase, validate_table_id,
+    dynamic_discovery_active, ensure_session_exists, fetch_onchain_table_view,
+    is_identity_missing_error, next_proof_session_id, resolve_deal_players_from_lobby,
+    select_mpc_nodes, validate_players, validate_reveal_phase, validate_table_id,
 };
 
 const MAX_PLAYERS: usize = 6;
 const MIN_PLAYERS: usize = 2;
+
+/// Derive the parameterised circuit name for a given base circuit and player
+/// count.  Returns e.g. `"deal_valid_2p"` for 2 players, falling back to the
+/// unparameterised `"deal_valid"` when the count equals MAX_PLAYERS or the
+/// parameterised variant is not expected to exist.
+fn parameterised_circuit_name(base: &str, player_count: usize) -> String {
+    if player_count >= MIN_PLAYERS && player_count < MAX_PLAYERS {
+        format!("{}_{}p", base, player_count)
+    } else {
+        base.to_string()
+    }
+}
+
+/// Partial session recovery when a single MPC node fails mid-session (Issue
+/// #235). Called after `mpc::is_node_unavailable_error` fires for a
+/// deal/reveal/showdown proof generation call: checkpoints the session's
+/// intermediate state and, if a healthy replacement node is available, swaps
+/// it into `session.selected_node_endpoints` so the caller's retry (still
+/// signalled via the existing CONFLICT response, per Issue #96) uses a
+/// working committee instead of failing again against the same dead node.
+async fn attempt_partial_recovery(
+    state: &AppState,
+    session: &mut TableSession,
+    node_endpoints: &[String],
+    error: &str,
+    circuit_name: &str,
+) {
+    let Some(failed_idx) = session_recovery::extract_failed_node_index(error) else {
+        return;
+    };
+    let Some(failed_endpoint) = node_endpoints.get(failed_idx) else {
+        return;
+    };
+
+    let replacements = if dynamic_discovery_active(state) {
+        state.node_registry.read().await.healthy_endpoints()
+    } else {
+        state.mpc_config.node_endpoints.clone()
+    };
+
+    // REP3 needs every original share-holder (see Issue #96 notes above), so
+    // the threshold is the full committee size: losing any node always
+    // requires a replacement rather than continuing with fewer nodes.
+    let outcome = session_recovery::recover_from_node_failure(
+        node_endpoints,
+        failed_endpoint,
+        node_endpoints.len(),
+        &replacements,
+    );
+
+    let last_checkpoint = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cached = session_cache::CachedSession {
+        session_id: format!("table-{}", session.table_id),
+        table_id: session.table_id,
+        phase: session.phase.clone(),
+        circuit_name: circuit_name.to_string(),
+        deck_root: session.deck_root.clone(),
+        hand_commitments: session.hand_commitments.clone(),
+        player_order: session.player_order.clone(),
+        dealt_indices: session.dealt_indices.clone(),
+        board_indices: session.board_indices.clone(),
+        reveal_tx_hashes: session.reveal_tx_hashes.clone(),
+        proof_nonce: session.proof_nonce,
+        last_checkpoint,
+    };
+    if let Err(e) = session_recovery::checkpoint_session_state(&cached) {
+        tracing::error!(
+            table_id = session.table_id,
+            "failed to checkpoint session state during node-failure recovery: {}",
+            e
+        );
+    }
+
+    match outcome {
+        session_recovery::RecoveryOutcome::ContinueWithRemaining { endpoints }
+        | session_recovery::RecoveryOutcome::Reassigned { endpoints, .. } => {
+            tracing::warn!(
+                table_id = session.table_id,
+                failed_node = %failed_endpoint,
+                new_committee = ?endpoints,
+                "MPC node failure recovery: committee updated for next retry"
+            );
+            session.selected_node_endpoints = endpoints;
+        }
+        session_recovery::RecoveryOutcome::AwaitingReplacement => {
+            tracing::error!(
+                table_id = session.table_id,
+                failed_node = %failed_endpoint,
+                "MPC node failure recovery: no healthy replacement available; session state checkpointed for later resumption"
+            );
+        }
+    }
+}
 
 pub struct SessionGuard {
     counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -44,7 +150,8 @@ impl SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -65,6 +172,15 @@ async fn reject_if_node_draining(state: &AppState) -> Result<(), StatusCode> {
 ///
 /// Public chain parameters used by the frontend for wallet-signed
 /// on-chain transactions.
+#[utoipa::path(
+    get,
+    path = "/api/chain-config",
+    tag = "Chain",
+    responses(
+        (status = 200, description = "Chain configuration", body = ChainConfigResponse),
+        (status = 503, description = "Soroban not configured")
+    )
+)]
 pub async fn get_chain_config(
     State(state): State<AppState>,
 ) -> Result<Json<ChainConfigResponse>, StatusCode> {
@@ -83,6 +199,22 @@ pub async fn get_chain_config(
 ///
 /// Creates a new empty on-chain table by copying config from the reference
 /// table. Players then join directly on-chain with their own wallet auth.
+#[utoipa::path(
+    post,
+    path = "/api/tables/create",
+    tag = "Tables",
+    request_body = CreateTableRequest,
+    responses(
+        (status = 200, description = "Table created", body = CreateTableResponse),
+        (status = 400, description = "Invalid parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Soroban not configured or solo mode disabled"),
+        (status = 502, description = "Soroban/MPC interaction failed")
+    ),
+    security(
+        ("WalletAuth" = [])
+    )
+)]
 pub async fn create_table(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -99,7 +231,10 @@ pub async fn create_table(
     if solo_mode
         && !state
             .feature_flags
-            .is_enabled(feature_flags::keys::SOLO_MODE, &feature_flags::FlagScope::Global)
+            .is_enabled(
+                feature_flags::keys::SOLO_MODE,
+                &feature_flags::FlagScope::Global,
+            )
             .await
     {
         tracing::warn!("create_table: solo_mode requested but feature flag is disabled");
@@ -163,12 +298,41 @@ pub async fn create_table(
             .insert(auth.address, creator_seat);
     }
 
+    let selected_node_endpoints = select_mpc_nodes(&state, req.region).await?;
+
     let table_view = fetch_onchain_table_view(&state.soroban_config, table_id)
         .await
         .map_err(|e| {
             tracing::error!("create_table fetch failed: {}", e);
             StatusCode::BAD_GATEWAY
         })?;
+
+    let session = TableSession {
+        table_id,
+        deck_root: String::new(),
+        hand_commitments: Vec::new(),
+        player_order: Vec::new(),
+        dealt_indices: Vec::new(),
+        player_card_positions: Vec::new(),
+        board_indices: Vec::new(),
+        phase: "waiting".to_string(),
+        deal_session_id: String::new(),
+        deal_tx_hash: None,
+        reveal_tx_hashes: HashMap::new(),
+        reveal_session_ids: HashMap::new(),
+        revealed_cards_by_phase: HashMap::new(),
+        selected_node_endpoints,
+        showdown_tx_hash: None,
+        showdown_session_id: None,
+        showdown_result: None,
+        proof_nonce: 0,
+        rit_phase: "inactive".to_string(),
+        rit_shared_board_count: 0,
+        mpc_node_progress: Vec::new(),
+        mpc_operation_started: None,
+        pinned_artifact_hashes: HashMap::new(),
+    };
+    state.tables.write().await.insert(table_id, session);
 
     Ok(Json(CreateTableResponse {
         table_id,
@@ -213,10 +377,84 @@ pub async fn list_open_tables(
             max_players: view.max_players,
             joined_wallets,
             open_wallet_slots,
+            spectators: state.spectators.count(table_id),
         });
     }
 
     Ok(Json(OpenTablesResponse { tables }))
+}
+
+/// GET /api/tables/overview
+///
+/// Multi-table overview for the mini-map (Issue #53): all known tables with
+/// seat counts and aggregate chip stacks.
+pub async fn list_table_overview(
+    State(state): State<AppState>,
+) -> Result<Json<crate::api::types::TableOverviewResponse>, StatusCode> {
+    use crate::api::types::{TableOverviewInfo, TableOverviewResponse};
+
+    if !state.soroban_config.is_configured() {
+        // Fall back to in-memory sessions when chain is not configured.
+        let tables_guard = state.tables.read().await;
+        let mut tables: Vec<TableOverviewInfo> = tables_guard
+            .keys()
+            .map(|table_id| TableOverviewInfo {
+                table_id: *table_id,
+                phase: "Unknown".to_string(),
+                max_players: 6,
+                seated: 0,
+                total_chips: 0,
+                stacks: Vec::new(),
+                spectators: state.spectators.count(*table_id),
+            })
+            .collect();
+        tables.sort_by_key(|t| t.table_id);
+        return Ok(Json(TableOverviewResponse { tables }));
+    }
+
+    let scan_max = std::env::var("OPEN_TABLE_SCAN_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(32);
+
+    // Also include live in-memory table ids beyond the scan window.
+    let session_ids: Vec<u32> = {
+        let guard = state.tables.read().await;
+        guard.keys().copied().collect()
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut tables = Vec::new();
+
+    let mut candidates: Vec<u32> = (0..scan_max).collect();
+    for id in session_ids {
+        if id >= scan_max {
+            candidates.push(id);
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    for table_id in candidates {
+        if !seen.insert(table_id) {
+            continue;
+        }
+        let Ok(view) = fetch_onchain_table_view(&state.soroban_config, table_id).await else {
+            continue;
+        };
+        let total_chips: i64 = view.stacks.iter().sum();
+        tables.push(TableOverviewInfo {
+            table_id,
+            phase: view.phase,
+            max_players: view.max_players,
+            seated: view.seats.len(),
+            total_chips,
+            stacks: view.stacks,
+            spectators: state.spectators.count(table_id),
+        });
+    }
+
+    Ok(Json(TableOverviewResponse { tables }))
 }
 
 /// POST /api/table/{table_id}/join
@@ -319,6 +557,7 @@ pub async fn request_deal(
 ) -> Result<Json<DealResponse>, StatusCode> {
     validate_table_id(table_id)?;
     enforce_rate_limit(&state, &headers, table_id, "request_deal").await?;
+    rate_limit::check_table_session_cap(&state.mpc_sessions, table_id).await?;
 
     let players = if req.players.is_empty() {
         resolve_deal_players_from_lobby(&state, table_id).await?
@@ -336,14 +575,63 @@ pub async fn request_deal(
         }
     }
 
-    if state.mpc_config.node_endpoints.is_empty() {
+    let mut tables = state.tables.write().await;
+    let session = if let Some(existing) = tables.get_mut(&table_id) {
+        if existing.phase != "waiting" && existing.phase != "settlement" {
+            return Err(StatusCode::CONFLICT);
+        }
+        existing
+    } else {
+        // This case shouldn't happen if create_table was called, but for robustness:
+        let selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+        let new_session = TableSession {
+            table_id,
+            deck_root: String::new(),
+            hand_commitments: Vec::new(),
+            player_order: Vec::new(),
+            dealt_indices: Vec::new(),
+            player_card_positions: Vec::new(),
+            board_indices: Vec::new(),
+            phase: "waiting".to_string(),
+            deal_session_id: String::new(),
+            deal_tx_hash: None,
+            reveal_tx_hashes: HashMap::new(),
+            reveal_session_ids: HashMap::new(),
+            revealed_cards_by_phase: HashMap::new(),
+            selected_node_endpoints,
+            showdown_tx_hash: None,
+            showdown_session_id: None,
+            showdown_result: None,
+            proof_nonce: 0,
+            rit_phase: "inactive".to_string(),
+            rit_shared_board_count: 0,
+            mpc_node_progress: Vec::new(),
+            mpc_operation_started: None,
+            pinned_artifact_hashes: HashMap::new(),
+        };
+        tables.insert(table_id, new_session);
+        tables.get_mut(&table_id).unwrap()
+    };
+
+    let node_endpoints = session.selected_node_endpoints.clone();
+    if node_endpoints.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     reject_if_node_draining(&state).await?;
 
+    let deal_span = tracing::info_span!(
+        "mpc.deal",
+        table_id = table_id,
+        player_count = players.len(),
+        circuit = tracing::field::Empty,
+        proof_session_id = tracing::field::Empty,
+    );
+    let _deal_span_guard = deal_span.enter();
+
     let prepared_deal = mpc::prepare_deal_from_nodes(
-        &state.mpc_config.node_endpoints,
+        &state.mpc_client,
+        &node_endpoints,
         &state.mpc_config.circuit_dir,
         table_id,
         &players,
@@ -355,20 +643,47 @@ pub async fn request_deal(
     })?;
 
     let proof_session_id = format!("table-{}-deal-{}", table_id, Uuid::new_v4());
+    // Issue #12: enforce single-use — reject if this session ID was already consumed.
+    {
+        let mut used = state.used_session_ids.write().await;
+        if !used.insert(proof_session_id.clone()) {
+            tracing::error!(
+                "Duplicate MPC session ID rejected (replay attack guard): {}",
+                proof_session_id
+            );
+            return Err(StatusCode::CONFLICT);
+        }
+    }
     let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
-    let deal_proof = mpc::generate_proof_from_share_sets(
+    let deal_circuit = parameterised_circuit_name(&req.circuit_name, players.len());
+    deal_span.record("circuit", deal_circuit.as_str());
+    deal_span.record("proof_session_id", proof_session_id.as_str());
+    let deal_proof = match mpc::generate_proof_from_share_sets(
+        &state.mpc_client,
         table_id,
         &prepared_deal.share_set_ids,
         &proof_session_id,
-        "deal_valid",
+        &deal_circuit,
         &state.mpc_config.circuit_dir,
-        &state.mpc_config.node_endpoints,
+        &node_endpoints,
     )
     .await
-    .map_err(|e| {
-        tracing::error!("Deal proof generation failed: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
+    {
+        Ok(proof) => proof,
+        Err(e) => {
+            tracing::error!("Deal proof generation failed: {}", e);
+            // Issue #96: a committee node that went down mid-session can't be
+            // recovered by retrying this same session (REP3 needs all 3
+            // original share-holders) — signal the caller to start a fresh
+            // deal instead of a generic gateway error. Issue #235: attempt to
+            // checkpoint state and line up a replacement node for that retry.
+            if mpc::is_node_unavailable_error(&e) {
+                attempt_partial_recovery(&state, session, &node_endpoints, &e, &deal_circuit).await;
+                return Err(StatusCode::CONFLICT);
+            }
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
 
     let parsed_deal =
         parse_deal_outputs(&deal_proof.public_inputs, players.len()).map_err(|e| {
@@ -407,27 +722,58 @@ pub async fn request_deal(
         })
         .collect();
 
-    let session = TableSession {
-        table_id,
-        deck_root: parsed_deal.deck_root.clone(),
-        hand_commitments: parsed_deal.hand_commitments.clone(),
-        player_order: players,
-        dealt_indices: parsed_deal.dealt_indices,
-        player_card_positions,
-        board_indices: Vec::new(),
-        phase: "preflop".to_string(),
-        deal_session_id: deal_proof.session_id.clone(),
-        deal_tx_hash: tx_hash.clone(),
-        reveal_tx_hashes: HashMap::new(),
-        reveal_session_ids: HashMap::new(),
-        revealed_cards_by_phase: HashMap::new(),
-        showdown_tx_hash: None,
-        showdown_session_id: None,
-        showdown_result: None,
-        proof_nonce: 0,
-    };
+    session.deck_root = parsed_deal.deck_root.clone();
+    session.hand_commitments = parsed_deal.hand_commitments.clone();
+    session.player_order = players;
+    session.dealt_indices = parsed_deal.dealt_indices;
+    session.player_card_positions = player_card_positions;
+    session.board_indices = Vec::new();
+    session.phase = "preflop".to_string();
+    session.rit_phase = "inactive".to_string();
+    session.rit_shared_board_count = 0;
+    session.deal_session_id = deal_proof.session_id.clone();
+    session.deal_tx_hash = tx_hash.clone();
+    session.reveal_tx_hashes = HashMap::new();
+    session.reveal_session_ids = HashMap::new();
+    session.revealed_cards_by_phase = HashMap::new();
+    session.showdown_tx_hash = None;
+    session.showdown_session_id = None;
+    session.showdown_result = None;
+    session.proof_nonce = 0;
 
-    state.tables.write().await.insert(table_id, session);
+    // Pin circuit artifact hashes for this session (Issue #256).
+    // Every reveal and showdown call will verify these before generating proofs.
+    let player_count = session.player_order.len();
+    let reveal_circuit = "reveal_board_valid".to_string();
+    let showdown_circuit_name = parameterised_circuit_name("showdown_valid", player_count);
+    let deal_circuit_name = deal_circuit.clone();
+    let circuits_to_pin: Vec<&str> =
+        vec![&deal_circuit_name, &reveal_circuit, &showdown_circuit_name];
+    match circuit_pins::pin_artifacts(&state.mpc_config.circuit_dir, &circuits_to_pin) {
+        Ok(pins) => {
+            tracing::info!(
+                table_id = table_id,
+                circuits = ?circuits_to_pin,
+                "circuit artifacts pinned for session"
+            );
+            session.pinned_artifact_hashes = pins;
+        }
+        Err(e) => {
+            // Artifacts may not be present in all environments (e.g. CI without
+            // compiled circuits). Log a warning but don't fail the deal — the
+            // empty map means no verification will be performed this session.
+            tracing::warn!(
+                table_id = table_id,
+                error = %e,
+                "circuit artifact pinning skipped (artifacts not found)"
+            );
+            session.pinned_artifact_hashes = HashMap::new();
+        }
+    }
+
+    drop(tables);
+
+    broadcast_table_state(&state, table_id).await;
 
     Ok(Json(DealResponse {
         status: "dealt".to_string(),
@@ -450,10 +796,7 @@ pub async fn request_reveal(
 
     let action = format!("request_reveal:{}", phase);
     enforce_rate_limit(&state, &headers, table_id, &action).await?;
-
-    if state.mpc_config.node_endpoints.is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    rate_limit::check_table_session_cap(&state.mpc_sessions, table_id).await?;
 
     reject_if_node_draining(&state).await?;
 
@@ -461,6 +804,11 @@ pub async fn request_reveal(
 
     let mut tables = state.tables.write().await;
     let session = tables.get_mut(&table_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    if session.selected_node_endpoints.is_empty() {
+        session.selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+    }
+    let node_endpoints = session.selected_node_endpoints.clone();
 
     // Any caller may trigger reveal progression.
     // Private card data remains protected by get_player_cards auth checks.
@@ -517,8 +865,34 @@ pub async fn request_reveal(
         }
     }
 
+    // Issue #256: verify pinned artifact hashes before generating the reveal proof.
+    if !session.pinned_artifact_hashes.is_empty() {
+        if let Err(e) = circuit_pins::verify_pinned_artifacts(
+            &state.mpc_config.circuit_dir,
+            &session.pinned_artifact_hashes,
+        ) {
+            tracing::error!(
+                table_id = table_id,
+                phase = %phase,
+                error = %e,
+                "circuit artifact changed mid-session — rejecting reveal"
+            );
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+
+    let reveal_span = tracing::info_span!(
+        "mpc.reveal",
+        table_id = table_id,
+        phase = %phase,
+        circuit = "reveal_board_valid",
+        proof_session_id = tracing::field::Empty,
+    );
+    let _reveal_span_guard = reveal_span.enter();
+
     let prepared_reveal = mpc::prepare_reveal_from_nodes(
-        &state.mpc_config.node_endpoints,
+        &state.mpc_client,
+        &node_endpoints,
         &state.mpc_config.circuit_dir,
         table_id,
         &phase,
@@ -532,20 +906,49 @@ pub async fn request_reveal(
     })?;
 
     let proof_session_id = next_proof_session_id(session, &format!("reveal-{}", phase));
+    // Issue #12: enforce single-use — reject if this session ID was already consumed.
+    {
+        let mut used = state.used_session_ids.write().await;
+        if !used.insert(proof_session_id.clone()) {
+            tracing::error!(
+                "Duplicate MPC session ID rejected (replay attack guard): {}",
+                proof_session_id
+            );
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+    reveal_span.record("proof_session_id", proof_session_id.as_str());
     let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
-    let reveal_proof = mpc::generate_proof_from_share_sets(
+    let reveal_proof = match mpc::generate_proof_from_share_sets(
+        &state.mpc_client,
         table_id,
         &prepared_reveal.share_set_ids,
         &proof_session_id,
         "reveal_board_valid",
         &state.mpc_config.circuit_dir,
-        &state.mpc_config.node_endpoints,
+        &node_endpoints,
     )
     .await
-    .map_err(|e| {
-        tracing::error!("Reveal proof generation failed: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
+    {
+        Ok(proof) => proof,
+        Err(e) => {
+            tracing::error!("Reveal proof generation failed: {}", e);
+            // Issue #96: see the deal-proof call site above. Issue #235:
+            // attempt recovery before signalling the caller to retry.
+            if mpc::is_node_unavailable_error(&e) {
+                attempt_partial_recovery(
+                    &state,
+                    session,
+                    &node_endpoints,
+                    &e,
+                    "reveal_board_valid",
+                )
+                .await;
+                return Err(StatusCode::CONFLICT);
+            }
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
 
     let num_revealed = match phase.as_str() {
         "flop" => 3usize,
@@ -597,6 +1000,9 @@ pub async fn request_reveal(
     session
         .revealed_cards_by_phase
         .insert(phase.clone(), parsed_reveal.cards.clone());
+    drop(tables);
+
+    broadcast_table_state(&state, table_id).await;
 
     Ok(Json(RevealResponse {
         status: "revealed".to_string(),
@@ -616,10 +1022,7 @@ pub async fn request_showdown(
     validate_table_id(table_id)?;
 
     enforce_rate_limit(&state, &headers, table_id, "request_showdown").await?;
-
-    if state.mpc_config.node_endpoints.is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    rate_limit::check_table_session_cap(&state.mpc_sessions, table_id).await?;
 
     reject_if_node_draining(&state).await?;
 
@@ -627,6 +1030,11 @@ pub async fn request_showdown(
 
     let mut tables = state.tables.write().await;
     let session = tables.get_mut(&table_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    if session.selected_node_endpoints.is_empty() {
+        session.selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+    }
+    let node_endpoints = session.selected_node_endpoints.clone();
 
     // Any caller may trigger showdown progression.
 
@@ -652,7 +1060,11 @@ pub async fn request_showdown(
         }));
     }
 
-    if session.phase != "river" && session.phase != "showdown" {
+    if session.phase != "river"
+        && session.phase != "showdown"
+        && session.phase != "showdown_run1"
+        && session.phase != "showdown_run2"
+    {
         return Err(StatusCode::CONFLICT);
     }
 
@@ -669,11 +1081,31 @@ pub async fn request_showdown(
         }
     }
 
+    // For Run 2 showdown, the correct board indices are the last 5 elements
+    // of board_indices, because Run 2's reveals include all 5 of its board cards
+    // (shared cards re-revealed + Run 2's new cards) at the end of the sequence.
+    let showdown_board_indices: Vec<u32> =
+        if session.phase == "showdown_run2" && session.board_indices.len() >= 5 {
+            session.board_indices[session.board_indices.len() - 5..].to_vec()
+        } else {
+            session.board_indices.clone()
+        };
+
+    let showdown_span = tracing::info_span!(
+        "mpc.showdown",
+        table_id = table_id,
+        player_count = session.player_order.len(),
+        circuit = tracing::field::Empty,
+        proof_session_id = tracing::field::Empty,
+    );
+    let _showdown_span_guard = showdown_span.enter();
+
     let prepared_showdown = mpc::prepare_showdown_from_nodes(
-        &state.mpc_config.node_endpoints,
+        &state.mpc_client,
+        &node_endpoints,
         &state.mpc_config.circuit_dir,
         table_id,
-        &session.board_indices,
+        &showdown_board_indices,
         session.player_order.len() as u32,
         &session.hand_commitments,
         &session.deck_root,
@@ -685,20 +1117,45 @@ pub async fn request_showdown(
     })?;
 
     let proof_session_id = next_proof_session_id(session, "showdown");
+    // Issue #12: enforce single-use — reject if this session ID was already consumed.
+    {
+        let mut used = state.used_session_ids.write().await;
+        if !used.insert(proof_session_id.clone()) {
+            tracing::error!(
+                "Duplicate MPC session ID rejected (replay attack guard): {}",
+                proof_session_id
+            );
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+    let showdown_circuit = parameterised_circuit_name("showdown_valid", session.player_order.len());
+    showdown_span.record("circuit", showdown_circuit.as_str());
+    showdown_span.record("proof_session_id", proof_session_id.as_str());
     let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
-    let showdown_proof = mpc::generate_proof_from_share_sets(
+    let showdown_proof = match mpc::generate_proof_from_share_sets(
+        &state.mpc_client,
         table_id,
         &prepared_showdown.share_set_ids,
         &proof_session_id,
-        "showdown_valid",
+        &showdown_circuit,
         &state.mpc_config.circuit_dir,
-        &state.mpc_config.node_endpoints,
+        &node_endpoints,
     )
     .await
-    .map_err(|e| {
-        tracing::error!("Showdown proof generation failed: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
+    {
+        Ok(proof) => proof,
+        Err(e) => {
+            tracing::error!("Showdown proof generation failed: {}", e);
+            // Issue #96: see the deal-proof call site above. Issue #235:
+            // attempt recovery before signalling the caller to retry.
+            if mpc::is_node_unavailable_error(&e) {
+                attempt_partial_recovery(&state, session, &node_endpoints, &e, &showdown_circuit)
+                    .await;
+                return Err(StatusCode::CONFLICT);
+            }
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
 
     let parsed_showdown =
         parse_showdown_outputs(&showdown_proof.public_inputs, session.player_order.len()).map_err(
@@ -771,17 +1228,50 @@ pub async fn request_showdown(
         }
     };
 
-    session.phase = "settlement".to_string();
-    session.showdown_tx_hash = tx_hash.clone();
-    session.showdown_session_id = Some(showdown_proof.session_id.clone());
-    session.showdown_result = if settled_by_timeout {
-        None
+    let is_rit_run1 = session.phase == "showdown_run1";
+    let is_rit_run2 = session.phase == "showdown_run2";
+
+    if is_rit_run1 {
+        // Run 1 showdown complete — transition to Run 2 dealing
+        session.phase = "preflop".to_string();
+        session.rit_phase = "run2_active".to_string();
+        session.showdown_tx_hash = tx_hash.clone();
+        session.showdown_session_id = Some(showdown_proof.session_id.clone());
+        // Don't cache showdown_result yet — Run 2 is still coming
+        session.showdown_result = None;
+    } else if is_rit_run2 {
+        // Run 2 showdown complete — full settlement
+        session.phase = "settlement".to_string();
+        session.showdown_tx_hash = tx_hash.clone();
+        session.showdown_session_id = Some(showdown_proof.session_id.clone());
+        session.showdown_result = if settled_by_timeout {
+            None
+        } else {
+            Some((winner.clone(), parsed_showdown.winner_index))
+        };
     } else {
-        Some((winner.clone(), parsed_showdown.winner_index))
-    };
+        // Normal showdown
+        session.phase = "settlement".to_string();
+        session.showdown_tx_hash = tx_hash.clone();
+        session.showdown_session_id = Some(showdown_proof.session_id.clone());
+        session.showdown_result = if settled_by_timeout {
+            None
+        } else {
+            Some((winner.clone(), parsed_showdown.winner_index))
+        };
+    }
+
+    let settle_participants = session.player_order.clone();
+    let settle_hand_number = session.proof_nonce as u32;
 
     let (status, winner, winner_index) = if settled_by_timeout {
         ("settled_timeout".to_string(), String::new(), 0)
+    } else if is_rit_run1 {
+        (
+            "showdown_run1_complete".to_string(),
+            winner.clone(),
+            parsed_showdown.winner_index,
+        )
     } else {
         (
             "showdown_complete".to_string(),
@@ -789,6 +1279,43 @@ pub async fn request_showdown(
             parsed_showdown.winner_index,
         )
     };
+    drop(tables);
+
+    // Issue #504: feed the anti-chip-dumping detector with a settled hand
+    // outcome. Only public data is used (participants, winner, pot size). When
+    // Soroban is unconfigured or the on-chain read fails the pot is left at 0
+    // and the detector's amount gate is relaxed to pattern-only detection.
+    if !settled_by_timeout && !is_rit_run1 && !winner.is_empty() {
+        let mut estimated_pot: i128 = 0;
+        if state.soroban_config.is_configured() {
+            if let Ok(raw) = soroban::get_table_state(&state.soroban_config, table_id).await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(players) = v.get("players").and_then(|p| p.as_array()) {
+                        for seat in players {
+                            if let Some(c) = seat.get("committed").and_then(|c| c.as_str()) {
+                                if let Ok(chips) = c.parse::<i128>() {
+                                    estimated_pot += chips;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(mut detector) = state.anti_dumping.lock() {
+            let outcome = anti_dumping::HandOutcome {
+                table_id,
+                session_id: table_id,
+                hand_number: settle_hand_number,
+                winner: Some(winner.clone()),
+                participants: settle_participants,
+                pot: estimated_pot,
+            };
+            detector.observe(outcome);
+        }
+    }
+
+    broadcast_table_state(&state, table_id).await;
 
     Ok(Json(ShowdownResponse {
         status,
@@ -797,6 +1324,66 @@ pub async fn request_showdown(
         proof_size: showdown_proof.proof.len(),
         session_id: showdown_proof.session_id,
         tx_hash,
+    }))
+}
+
+/// POST /api/table/{table_id}/rit-opt-in
+///
+/// Opt into or decline Run-It-Twice when heads-up all-in.
+#[utoipa::path(
+    post,
+    path = "/api/table/{table_id}/rit-opt-in",
+    tag = "Tables",
+    request_body = RitOptInRequest,
+    responses(
+        (status = 200, description = "RIT opt-in processed", body = RitOptInResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Soroban not configured"),
+    ),
+    security(
+        ("WalletAuth" = [])
+    )
+)]
+pub async fn rit_opt_in(
+    State(state): State<AppState>,
+    Path(table_id): Path<u32>,
+    headers: HeaderMap,
+    Json(req): Json<RitOptInRequest>,
+) -> Result<Json<RitOptInResponse>, StatusCode> {
+    validate_table_id(table_id)?;
+    enforce_rate_limit(&state, &headers, table_id, "rit_opt_in").await?;
+    let auth = validate_signed_request(&state, &headers, table_id, "rit_opt_in", None).await?;
+
+    if !state.soroban_config.is_configured() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let tx_hash =
+        soroban::submit_rit_opt_in(&state.soroban_config, table_id, &auth.address, req.opt_in)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "rit_opt_in failed: table={}, player={}, opt_in={}, err={}",
+                    table_id,
+                    auth.address,
+                    req.opt_in,
+                    e
+                );
+                if e.contains("Error(Contract,") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            })?;
+
+    Ok(Json(RitOptInResponse {
+        status: "success".to_string(),
+        tx_hash: if tx_hash.is_empty() {
+            None
+        } else {
+            Some(tx_hash)
+        },
     }))
 }
 
@@ -863,6 +1450,7 @@ pub async fn player_action(
         &player_address,
         &normalized,
         amount,
+        req.seq,
     )
     .await
     .map_err(|e| {
@@ -887,12 +1475,192 @@ pub async fn player_action(
     } else {
         Some(tx_hash)
     };
+
+    // Issue #55: track HUD stats (VPIP / PFR / AF) from live actions.
+    let is_preflop = {
+        let tables = state.tables.read().await;
+        tables
+            .get(&table_id)
+            .map(|s| {
+                let p = s.phase.to_ascii_lowercase();
+                p.contains("preflop") || p == "dealing" || p.is_empty()
+            })
+            .unwrap_or(true)
+    };
+    crate::stats::record_player_action(&state.stats, &player_address, &normalized, is_preflop)
+        .await;
+
+    broadcast_table_state(&state, table_id).await;
+
     Ok(Json(PlayerActionResponse {
         status: "applied".to_string(),
         action: normalized,
         amount,
         player: player_address,
         tx_hash,
+    }))
+}
+
+/// POST /api/table/{table_id}/transfer-chips
+///
+/// Transfer chips from this table to another table where the player is also seated.
+/// A small fee (in basis points) is deducted from the transferred amount.
+/// Both tables must be in a state that allows transfers (e.g., not in active hand).
+#[utoipa::path(
+    post,
+    path = "/api/table/{table_id}/transfer-chips",
+    tag = "Tables",
+    params(
+        ("table_id" = u32, Path, description = "Source table ID")
+    ),
+    request_body = TransferChipsRequest,
+    responses(
+        (status = 200, description = "Chips transferred", body = TransferChipsResponse),
+        (status = 400, description = "Invalid parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Table not found"),
+        (status = 409, description = "Player not seated at both tables or insufficient chips"),
+        (status = 503, description = "Soroban not configured")
+    ),
+    security(
+        ("WalletAuth" = [])
+    )
+)]
+pub async fn transfer_chips(
+    State(state): State<AppState>,
+    Path(source_table_id): Path<u32>,
+    headers: HeaderMap,
+    Json(req): Json<TransferChipsRequest>,
+) -> Result<Json<TransferChipsResponse>, StatusCode> {
+    validate_table_id(source_table_id)?;
+    validate_table_id(req.destination_table_id)?;
+
+    if source_table_id == req.destination_table_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    enforce_rate_limit(&state, &headers, source_table_id, "transfer_chips").await?;
+    let auth =
+        validate_signed_request(&state, &headers, source_table_id, "transfer_chips", None).await?;
+
+    if !state.soroban_config.is_configured() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // Check if player is seated at source table
+    let source_view = fetch_onchain_table_view(&state.soroban_config, source_table_id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let is_seated_at_source = source_view
+        .seats
+        .iter()
+        .any(|(_, chain)| chain == &auth.address);
+    if !is_seated_at_source {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Check if player is seated at destination table
+    let dest_view = fetch_onchain_table_view(&state.soroban_config, req.destination_table_id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let is_seated_at_dest = dest_view
+        .seats
+        .iter()
+        .any(|(_, chain)| chain == &auth.address);
+    if !is_seated_at_dest {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Validate amount
+    if req.amount <= 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Find player's stack at source table
+    let player_stack_at_source = source_view
+        .seats
+        .iter()
+        .find(|(_, chain)| chain == &auth.address)
+        .and_then(|(seat, _)| source_view.stacks.get(*seat as usize).copied())
+        .unwrap_or(0);
+
+    if (player_stack_at_source as i128) < req.amount {
+        return Err(StatusCode::CONFLICT); // Insufficient chips
+    }
+
+    // Fee in basis points (default 100 = 1%)
+    let fee_basis_points = std::env::var("TRANSFER_FEE_BASIS_POINTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(100);
+
+    let fee = (req.amount * fee_basis_points as i128) / 10000;
+    let net_amount = req.amount - fee;
+
+    // Execute on-chain transfer
+    let (source_tx_hash, dest_tx_hash) = soroban::transfer_chips(
+        &state.soroban_config,
+        source_table_id,
+        req.destination_table_id,
+        &auth.address,
+        req.amount,
+        fee_basis_points,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            "transfer_chips failed: source_table={}, dest_table={}, player={}, amount={}, err={}",
+            source_table_id,
+            req.destination_table_id,
+            auth.address,
+            req.amount,
+            e
+        );
+        if e.contains("Error(Contract,") {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_GATEWAY
+        }
+    })?;
+
+    // Log audit entry for the transfer
+    if let Some(pool) = &state.db_pool {
+        let request_id = uuid::Uuid::new_v4();
+        let _ = crate::audit_log::log_audit_entry(
+            pool,
+            request_id,
+            Some(&auth.address),
+            "transfer_chips",
+            &format!("/api/table/{}/transfer-chips", source_table_id),
+            &axum::http::Method::POST,
+            crate::audit_log::extract_ip_address(&headers).as_deref(),
+            Some(200),
+            None,
+            Some(source_table_id as i32),
+            None,
+        )
+        .await;
+    }
+
+    Ok(Json(TransferChipsResponse {
+        status: "transferred".to_string(),
+        source_table_id,
+        destination_table_id: req.destination_table_id,
+        amount: req.amount,
+        fee,
+        net_amount,
+        source_tx_hash: if source_tx_hash.is_empty() {
+            None
+        } else {
+            Some(source_tx_hash)
+        },
+        dest_tx_hash: if dest_tx_hash.is_empty() {
+            None
+        } else {
+            Some(dest_tx_hash)
+        },
     }))
 }
 
@@ -925,28 +1693,65 @@ pub async fn get_player_cards(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let player_index = session
-        .player_order
-        .iter()
-        .position(|p| p == &address)
-        .or_else(|| if insecure_auth { Some(0) } else { None })
-        .ok_or(StatusCode::NOT_FOUND)?;
+    // Issue #509: the request-named `address` must be the signed caller's own
+    // identity (a cross-session read of another seat is denied and audited).
+    let isolation_claim = crate::session_isolation::SessionClaim {
+        table_id,
+        address: address.clone(),
+        seat_index: None,
+    };
+    let player_index = match crate::session_isolation::authorize_cards_read(
+        &isolation_claim,
+        &session.player_order,
+        &auth.address,
+        insecure_auth,
+    ) {
+        Ok(idx) => idx,
+        Err(denial) => {
+            // Dev-mode escape hatch: any caller may read seat 0 (Issue #509
+            // still audits real cross-session attempts).
+            if insecure_auth && denial == crate::session_isolation::IsolationDenial::NotSeated {
+                0
+            } else {
+                record_isolation_denial(
+                    &state,
+                    table_id,
+                    &auth.address,
+                    crate::session_isolation::IsolationOperation::ReadHoleCards,
+                    denial,
+                )
+                .await;
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+    };
 
     let (pos1, pos2) = session
         .player_card_positions
         .get(player_index)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let node_endpoints = state.mpc_config.node_endpoints.clone();
+    let mut node_endpoints = session.selected_node_endpoints.clone();
+    if node_endpoints.is_empty() {
+        node_endpoints = select_mpc_nodes(&state, None).await?;
+    }
     let positions = vec![*pos1, *pos2];
+    let hand_commitment = session.hand_commitments.get(player_index).cloned();
     drop(tables); // release read lock before async call
 
-    let (cards, salts) = mpc::resolve_hole_cards(&node_endpoints, table_id, &positions)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to resolve hole cards: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+    // Reconstructed cards are checked against the deal proof's hand
+    // commitment, retrying on mismatch (Issue #139).
+    let (cards, salts) = mpc_validation::resolve_validated(
+        table_id,
+        hand_commitment.as_deref(),
+        mpc_validation::ValidationMode::from_env(),
+        || mpc::resolve_hole_cards(&state.mpc_client, &node_endpoints, table_id, &positions),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to resolve hole cards: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
 
     if cards.len() < 2 || salts.len() < 2 {
         return Err(StatusCode::BAD_GATEWAY);
@@ -958,6 +1763,108 @@ pub async fn get_player_cards(
         salt1: salts[0].clone(),
         salt2: salts[1].clone(),
     }))
+}
+
+/// Serializable snapshot of a table's in-memory session state, pushed to
+/// WebSocket subscribers of `/api/table/:table_id/state/ws` whenever a deal,
+/// reveal, showdown, or player action mutates it.
+#[derive(Serialize, Clone)]
+pub struct GameStateEvent {
+    pub table_id: u32,
+    pub phase: String,
+    pub deck_root: String,
+    pub board_indices: Vec<u32>,
+    pub dealt_indices: Vec<u32>,
+    pub deal_tx_hash: Option<String>,
+    pub reveal_tx_hashes: HashMap<String, String>,
+    pub showdown_tx_hash: Option<String>,
+    /// Raw on-chain `get_table` JSON (betting/pot/turn state), the same
+    /// payload `GET /api/table/:table_id/state` returns. `None` when Soroban
+    /// isn't configured or the read failed.
+    pub onchain_state: Option<String>,
+    /// Live anonymous spectators watching this table (Issue #171).
+    pub spectator_count: usize,
+}
+
+impl GameStateEvent {
+    fn from_session(session: &TableSession) -> Self {
+        Self {
+            table_id: session.table_id,
+            phase: session.phase.clone(),
+            deck_root: session.deck_root.clone(),
+            board_indices: session.board_indices.clone(),
+            dealt_indices: session.dealt_indices.clone(),
+            deal_tx_hash: session.deal_tx_hash.clone(),
+            reveal_tx_hashes: session.reveal_tx_hashes.clone(),
+            showdown_tx_hash: session.showdown_tx_hash.clone(),
+            onchain_state: None,
+            spectator_count: 0,
+        }
+    }
+}
+
+/// Push the current state for `table_id` to any WebSocket clients subscribed
+/// via `/api/table/:table_id/state/ws`. No-op if nobody has connected for
+/// this table yet. Best-effort: a failed on-chain read still pushes the
+/// in-memory snapshot.
+pub async fn broadcast_table_state(state: &AppState, table_id: u32) {
+    let has_subscribers = {
+        let channels = state.game_state_channels.lock().await;
+        channels
+            .get(&table_id)
+            .map(|tx| tx.receiver_count() > 0)
+            .unwrap_or(false)
+    };
+    if !has_subscribers {
+        return;
+    }
+
+    let event = {
+        let tables = state.tables.read().await;
+        tables.get(&table_id).map(GameStateEvent::from_session)
+    };
+    let Some(mut event) = event else {
+        return;
+    };
+    event.spectator_count = state.spectators.count(table_id);
+
+    if state.soroban_config.is_configured() {
+        event.onchain_state = soroban::get_table_state(&state.soroban_config, table_id)
+            .await
+            .ok();
+    }
+
+    let Ok(payload) = serde_json::to_string(&event) else {
+        return;
+    };
+
+    let channels = state.game_state_channels.lock().await;
+    if let Some(tx) = channels.get(&table_id) {
+        let _ = tx.send(payload);
+    }
+}
+
+/// Current state snapshot as JSON, used to greet a newly-connected
+/// WebSocket client so it doesn't have to wait for the next mutation.
+pub async fn current_game_state_json(state: &AppState, table_id: u32) -> Option<String> {
+    let tables = state.tables.read().await;
+    let mut event = tables.get(&table_id).map(GameStateEvent::from_session)?;
+    event.spectator_count = state.spectators.count(table_id);
+    serde_json::to_string(&event).ok()
+}
+
+/// GET /api/table/{table_id}/spectators
+///
+/// Number of anonymous spectators currently connected to the table's
+/// `/spectate/ws` stream (Issue #171). Public, no auth.
+pub async fn get_spectator_count(
+    State(state): State<AppState>,
+    Path(table_id): Path<u32>,
+) -> Json<SpectatorCountResponse> {
+    Json(SpectatorCountResponse {
+        table_id,
+        spectator_count: state.spectators.count(table_id),
+    })
 }
 
 /// GET /api/table/{table_id}/state
@@ -975,24 +1882,204 @@ pub async fn get_table_state(
     Ok(Json(TableStateResponse { state: result }))
 }
 
+/// GET /api/table/{table_id}/players?offset=0&limit=6
+///
+/// Offset-based paginated player list. Extends TTL of the table entry
+/// (bump-on-read pattern) to keep the pagination cursor alive.
+pub async fn get_players_paginated(
+    State(state): State<AppState>,
+    Path(table_id): Path<u32>,
+    Query(params): Query<PaginatedQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(6).min(50);
+    let raw = soroban::get_players_paginated(&state.soroban_config, table_id, offset, limit)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to read paginated players: {}", e);
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    let players: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or(serde_json::Value::Array(vec![]));
+
+    // Also fetch total count
+    let total_raw = soroban::get_player_count(&state.soroban_config, table_id).await;
+    let total: u32 = total_raw
+        .ok()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .and_then(|v| v.as_u64().map(|n| n as u32))
+        .unwrap_or(0);
+
+    Ok(Json(serde_json::json!({
+        "players": players,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    })))
+}
+
+/// GET /api/table/{table_id}/hand-history/chunk?offset=0&limit=5
+///
+/// Offset-based paginated hand history (newest first). Each hand record
+/// read on-chain has its TTL extended, keeping pagination cursors alive.
+pub async fn get_hand_history_chunk(
+    State(state): State<AppState>,
+    Path(table_id): Path<u32>,
+    Query(params): Query<PaginatedQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(5).min(16);
+    let raw = soroban::get_hand_history_chunk(&state.soroban_config, table_id, offset, limit)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to read hand history chunk: {}", e);
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    let records: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or(serde_json::Value::Array(vec![]));
+
+    // Also fetch the meta for total available
+    let meta_raw = soroban::get_table_state(&state.soroban_config, table_id)
+        .await
+        .ok()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok());
+    let total = meta_raw
+        .as_ref()
+        .and_then(|v| v.get("hand_number"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    Ok(Json(serde_json::json!({
+        "records": records,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "capacity": 16u32,
+    })))
+}
+
+/// GET /api/table/{table_id}/mpc-status
+///
+/// Returns per-node MPC phase progress for the table's current operation.
+/// The frontend polls this during deal/reveal/showdown to show a live
+/// indicator of which nodes have responded.
+pub async fn get_mpc_status(
+    State(state): State<AppState>,
+    Path(table_id): Path<u32>,
+) -> Result<Json<types::TableMpcStatusResponse>, StatusCode> {
+    validate_table_id(table_id)?;
+
+    let tables = state.tables.read().await;
+    let session = tables.get(&table_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let active_sessions = state.mpc_sessions.read().await.len();
+
+    Ok(Json(types::TableMpcStatusResponse {
+        table_id,
+        phase: session.phase.clone(),
+        nodes: session.mpc_node_progress.clone(),
+        active_sessions,
+    }))
+}
+
 /// GET /api/committee/status
 pub async fn committee_status(State(state): State<AppState>) -> Json<CommitteeStatusResponse> {
-    let healthy = mpc::check_node_health(&state.mpc_config.node_endpoints).await;
-    let draining = state
-        .metrics
-        .node_healths
-        .lock()
-        .await
-        .iter()
-        .map(|n| n.draining)
-        .collect::<Vec<_>>();
+    let healths = state.metrics.node_healths.lock().await;
+    let nodes = healths.len();
+    let healthy = healths.iter().map(|h| h.connected).collect();
+    let draining = healths.iter().map(|h| h.draining).collect();
 
     Json(CommitteeStatusResponse {
-        nodes: state.mpc_config.node_endpoints.len(),
+        nodes,
         healthy,
         status: "active".to_string(),
         draining,
     })
+}
+
+/// POST /api/node/register
+///
+/// Self-registration (and implicit heartbeat) for an MPC node. Only available
+/// when dynamic discovery is active (no committee registry and no static
+/// `MPC_NODE_*` endpoints); otherwise returns `409 Conflict`.
+pub async fn register_node(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterNodeRequest>,
+) -> Result<Json<NodeRegistryResponse>, StatusCode> {
+    if !dynamic_discovery_active(&state) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let id = req.id.trim();
+    let endpoint = req.endpoint.trim();
+    if id.is_empty() || !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut registry = state.node_registry.write().await;
+    let created = registry.register(id.to_string(), endpoint.to_string());
+    tracing::info!(
+        "MPC node '{}' {} ({})",
+        id,
+        if created { "registered" } else { "refreshed" },
+        endpoint
+    );
+    Ok(Json(NodeRegistryResponse {
+        id: id.to_string(),
+        registered: registry.len(),
+        healthy: registry.healthy_endpoints().len(),
+    }))
+}
+
+/// POST /api/node/{id}/heartbeat
+///
+/// Keep an existing registration alive. Returns `404` if the node is unknown
+/// (the node should re-register), or `409` when dynamic discovery is inactive.
+pub async fn node_heartbeat(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<NodeRegistryResponse>, StatusCode> {
+    if !dynamic_discovery_active(&state) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let mut registry = state.node_registry.write().await;
+    if !registry.heartbeat(&id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(NodeRegistryResponse {
+        id,
+        registered: registry.len(),
+        healthy: registry.healthy_endpoints().len(),
+    }))
+}
+
+/// DELETE /api/node/{id}
+///
+/// Graceful deregistration (e.g. on node shutdown). Returns `404` if unknown,
+/// or `409` when dynamic discovery is inactive.
+pub async fn deregister_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<NodeRegistryResponse>, StatusCode> {
+    if !dynamic_discovery_active(&state) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let mut registry = state.node_registry.write().await;
+    if !registry.deregister(&id) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    tracing::info!("MPC node '{}' deregistered", id);
+    Ok(Json(NodeRegistryResponse {
+        id,
+        registered: registry.len(),
+        healthy: registry.healthy_endpoints().len(),
+    }))
 }
 
 /// POST /api/session/:session_id/cancel
@@ -1005,19 +2092,19 @@ pub async fn cancel_mpc_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let auth = admin::validate_admin_request(
-        &state,
-        &headers,
-        "cancel_session",
-        &state.admin_state,
-    )
-    .await?;
+    let auth =
+        admin::validate_admin_request(&state, &headers, "cancel_session", &state.admin_state)
+            .await?;
     admin::require_role(&auth, admin::AdminRole::Operator)?;
 
     let cancelled = session_gc::cancel_session(
         &state.mpc_sessions,
         &session_id,
-        &format!("manual admin cancel by {} ({})", auth.address, auth.role.as_str()),
+        &format!(
+            "manual admin cancel by {} ({})",
+            auth.address,
+            auth.role.as_str()
+        ),
         false,
     )
     .await;
@@ -1038,18 +2125,16 @@ pub async fn admin_health(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let auth = admin::validate_admin_request(
-        &state,
-        &headers,
-        "admin_health",
-        &state.admin_state,
-    )
-    .await?;
+    let auth =
+        admin::validate_admin_request(&state, &headers, "admin_health", &state.admin_state).await?;
     admin::require_role(&auth, admin::AdminRole::ReadOnly)?;
 
     let uptime_seconds = state.metrics.boot_time.elapsed().as_secs();
     let mpc_nodes = state.metrics.node_healths.lock().await.clone();
-    let active_mpc_sessions = state.metrics.active_mpc_sessions.load(std::sync::atomic::Ordering::SeqCst);
+    let active_mpc_sessions = state
+        .metrics
+        .active_mpc_sessions
+        .load(std::sync::atomic::Ordering::SeqCst);
     let request_metrics = state.metrics.route_metrics.lock().await.clone();
 
     let session_count = state.mpc_sessions.read().await.len();
@@ -1076,13 +2161,9 @@ pub async fn admin_list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let auth = admin::validate_admin_request(
-        &state,
-        &headers,
-        "admin_list_sessions",
-        &state.admin_state,
-    )
-    .await?;
+    let auth =
+        admin::validate_admin_request(&state, &headers, "admin_list_sessions", &state.admin_state)
+            .await?;
     admin::require_role(&auth, admin::AdminRole::Operator)?;
 
     let sessions = state.mpc_sessions.read().await;
@@ -1103,6 +2184,109 @@ pub async fn admin_list_sessions(
     })))
 }
 
+/// GET /api/admin/anti-dumping/reports
+///
+/// Return current anti-chip-dumping signals (Issue #504). Requires operator or
+/// higher. Responses are read-only; the detector never exposes private card or
+/// authority data.
+pub async fn admin_anti_dumping_reports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let auth = admin::validate_admin_request(
+        &state,
+        &headers,
+        "admin_anti_dumping_reports",
+        &state.admin_state,
+    )
+    .await?;
+    admin::require_role(&auth, admin::AdminRole::Operator)?;
+
+    let detector_lock = state
+        .anti_dumping
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let reports = detector_lock.reports();
+    let count = reports.len();
+    let window_hands = detector_lock.hand_count();
+    let list: Vec<serde_json::Value> = reports
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "table_id": s.table_id,
+                "suspect": s.suspect,
+                "beneficiary": s.beneficiary,
+                "donated": s.donated,
+                "encounters": s.encounters,
+                "observed_rate": s.observed_rate,
+                "z_score": s.z_score,
+            })
+        })
+        .collect();
+    drop(detector_lock);
+
+    Ok(Json(serde_json::json!({
+        "count": count,
+        "window_hands": window_hands,
+        "reports": list,
+    })))
+}
+
+/// Record an Issue #509 isolation denial: append to the in-memory roll and, when
+/// a database is configured, ship the drained records to the append-only audit
+/// log. Never blocks the active request on a slow database.
+pub async fn record_isolation_denial(
+    state: &AppState,
+    table_id: u32,
+    caller: &str,
+    operation: crate::session_isolation::IsolationOperation,
+    denial: crate::session_isolation::IsolationDenial,
+) {
+    let pending = {
+        let mut audit = match state.isolation_audit.lock() {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        crate::session_isolation::record_denial(
+            &mut audit,
+            table_id,
+            caller,
+            operation,
+            denial,
+            None,
+        );
+        audit.drain()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let Some(pool) = state.db_pool.clone() else {
+        return;
+    };
+    for rec in pending {
+        let (action, endpoint, message, tid, session_id) = rec.to_audit_fields();
+        let method = axum::http::Method::POST;
+        let caller = rec.caller_address.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let _ = crate::audit_log::log_audit_entry(
+                &pool,
+                Uuid::new_v4(),
+                Some(&caller),
+                &action,
+                &endpoint,
+                &method,
+                None,
+                Some(401),
+                Some(&message),
+                Some(tid),
+                session_id.as_deref(),
+            )
+            .await;
+        });
+    }
+}
+
 /// POST /api/admin/sessions/:session_id/cancel
 ///
 /// Cancel a specific MPC session by ID. Requires operator or higher.
@@ -1111,23 +2295,14 @@ pub async fn admin_cancel_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let auth = admin::validate_admin_request(
-        &state,
-        &headers,
-        "admin_cancel_session",
-        &state.admin_state,
-    )
-    .await?;
+    let auth =
+        admin::validate_admin_request(&state, &headers, "admin_cancel_session", &state.admin_state)
+            .await?;
     admin::require_role(&auth, admin::AdminRole::Operator)?;
 
     let reason = format!("admin cancel by {} ({})", auth.address, auth.role.as_str());
-    let cancelled = session_gc::cancel_session(
-        &state.mpc_sessions,
-        &session_id,
-        &reason,
-        false,
-    )
-    .await;
+    let cancelled =
+        session_gc::cancel_session(&state.mpc_sessions, &session_id, &reason, false).await;
 
     Ok(Json(serde_json::json!({
         "session_id": session_id,
@@ -1189,17 +2364,15 @@ pub async fn admin_stats(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let auth = admin::validate_admin_request(
-        &state,
-        &headers,
-        "admin_stats",
-        &state.admin_state,
-    )
-    .await?;
+    let auth =
+        admin::validate_admin_request(&state, &headers, "admin_stats", &state.admin_state).await?;
     admin::require_role(&auth, admin::AdminRole::ReadOnly)?;
 
     let uptime = state.metrics.boot_time.elapsed().as_secs();
-    let active_sessions = state.metrics.active_mpc_sessions.load(std::sync::atomic::Ordering::SeqCst);
+    let active_sessions = state
+        .metrics
+        .active_mpc_sessions
+        .load(std::sync::atomic::Ordering::SeqCst);
     let route_metrics = state.metrics.route_metrics.lock().await.clone();
     let node_healths = state.metrics.node_healths.lock().await.clone();
 
@@ -1233,13 +2406,9 @@ pub async fn admin_reload_config(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let auth = admin::validate_admin_request(
-        &state,
-        &headers,
-        "admin_reload_config",
-        &state.admin_state,
-    )
-    .await?;
+    let auth =
+        admin::validate_admin_request(&state, &headers, "admin_reload_config", &state.admin_state)
+            .await?;
     admin::require_role(&auth, admin::AdminRole::SuperAdmin)?;
 
     let new_config = admin::AdminConfig::from_env();
@@ -1279,67 +2448,103 @@ pub async fn get_mpc_session_status(
     })))
 }
 
-/// POST /api/wallet/challenge
-pub async fn get_wallet_challenge(
+/// GET /api/admin/archives
+///
+/// Query archived sessions by ID, table ID, or time range.
+/// Requires operator or higher.
+pub async fn admin_list_archives(
     State(state): State<AppState>,
-    Json(req): Json<WalletChallengeRequest>,
-) -> Result<Json<WalletChallengeResponse>, StatusCode> {
-    let address = req.address.trim().to_string();
-    if !is_valid_stellar_address(&address) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    headers: HeaderMap,
+    Query(query): Query<ArchiveQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let auth =
+        admin::validate_admin_request(&state, &headers, "admin_list_archives", &state.admin_state)
+            .await?;
+    admin::require_role(&auth, admin::AdminRole::Operator)?;
 
-    let challenge = format!(
-        "stellar-poker-challenge|{}|{}",
-        Uuid::new_v4(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    );
+    let from_ts = query
+        .from_timestamp
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
 
-    let mut guard = state.wallet_challenges.write().await;
-    let now = std::time::Instant::now();
-    guard.retain(|_, (_, created_at)| now.duration_since(*created_at) < std::time::Duration::from_secs(300));
-    guard.insert(address, (challenge.clone(), now));
+    let to_ts = query
+        .to_timestamp
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
 
-    Ok(Json(WalletChallengeResponse { challenge }))
+    let limit = query.limit.unwrap_or(50).min(200);
+    let offset = query.offset.unwrap_or(0);
+
+    let archives = crate::archiver::query_archives(
+        &state.archive_store,
+        query.session_id.as_deref(),
+        query.table_id,
+        from_ts,
+        to_ts,
+        limit,
+        offset,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "archives": archives,
+        "count": archives.len(),
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
-/// POST /api/wallet/verify
-pub async fn verify_wallet(
+/// GET /api/admin/archives/:archive_id
+///
+/// Retrieve a single archived session by archive ID.
+/// Requires operator or higher.
+pub async fn admin_get_archive(
     State(state): State<AppState>,
-    Json(req): Json<WalletVerifyRequest>,
-) -> Result<Json<WalletVerifyResponse>, StatusCode> {
-    let address = req.address.trim().to_string();
-    let challenge = req.challenge;
-    let signature = req.signature;
+    headers: HeaderMap,
+    Path(archive_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let auth =
+        admin::validate_admin_request(&state, &headers, "admin_get_archive", &state.admin_state)
+            .await?;
+    admin::require_role(&auth, admin::AdminRole::Operator)?;
 
-    if !is_valid_stellar_address(&address) {
-        return Err(StatusCode::BAD_REQUEST);
+    match crate::archiver::restore_archived_session(&state.archive_store, &archive_id).await {
+        Some(archived) => Ok(Json(serde_json::json!(archived))),
+        None => Err(StatusCode::NOT_FOUND),
     }
+}
 
-    let mut guard = state.wallet_challenges.write().await;
-    let now = std::time::Instant::now();
-    guard.retain(|_, (_, created_at)| now.duration_since(*created_at) < std::time::Duration::from_secs(300));
+/// POST /api/admin/archives/purge
+///
+/// Manually trigger purge of archives that exceed the purge TTL.
+/// Requires operator or higher.
+pub async fn admin_purge_archives(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let auth =
+        admin::validate_admin_request(&state, &headers, "admin_purge_archives", &state.admin_state)
+            .await?;
+    admin::require_role(&auth, admin::AdminRole::Operator)?;
 
-    let Some((stored_challenge, created_at)) = guard.get(&address) else {
-        return Ok(Json(WalletVerifyResponse { verified: false }));
-    };
+    let purged =
+        crate::archiver::purge_old_archives(&state.archive_store, &state.archive_config).await;
 
-    if stored_challenge != &challenge {
-        return Ok(Json(WalletVerifyResponse { verified: false }));
-    }
+    Ok(Json(serde_json::json!({
+        "purged": purged,
+        "action_by": auth.address,
+        "role": auth.role.as_str(),
+    })))
+}
 
-    if now.duration_since(*created_at) >= std::time::Duration::from_secs(300) {
-        guard.remove(&address);
-        return Ok(Json(WalletVerifyResponse { verified: false }));
-    }
-
-    if verify_signature(&address, &challenge, &signature).is_ok() {
-        guard.remove(&address);
-        Ok(Json(WalletVerifyResponse { verified: true }))
-    } else {
-        Ok(Json(WalletVerifyResponse { verified: false }))
-    }
+#[derive(serde::Deserialize)]
+pub struct ArchiveQuery {
+    pub session_id: Option<String>,
+    pub table_id: Option<u32>,
+    pub from_timestamp: Option<String>,
+    pub to_timestamp: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }

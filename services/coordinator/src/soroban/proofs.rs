@@ -21,6 +21,15 @@ pub async fn submit_deal_proof(
         return Ok(String::new());
     }
 
+    // Issue #108: content-addressable cache of already-verified proofs, so a
+    // retried submission of byte-identical proof data skips the (expensive)
+    // on-chain re-verification and just replays the prior tx hash.
+    let cache_key = crate::proof_cache::proof_key(proof, public_inputs);
+    if let Some(tx_hash) = crate::proof_cache::get(&cache_key).await {
+        tracing::info!("Deal proof cache hit — skipping redundant on-chain verification");
+        return Ok(tx_hash);
+    }
+
     maybe_start_hand_for_deal(config, table_id).await?;
 
     let onchain_table_id = resolve_onchain_table_id(config, table_id);
@@ -63,7 +72,9 @@ pub async fn submit_deal_proof(
     )
     .await?;
 
-    parse_tx_result(output)
+    let tx_hash = parse_tx_result(output)?;
+    crate::proof_cache::insert(cache_key, tx_hash.clone()).await;
+    Ok(tx_hash)
 }
 
 async fn maybe_start_hand_for_deal(config: &SorobanConfig, table_id: u32) -> Result<(), String> {
@@ -119,6 +130,12 @@ pub async fn submit_reveal_proof(
         return Ok(String::new());
     }
 
+    let cache_key = crate::proof_cache::proof_key(proof, public_inputs);
+    if let Some(tx_hash) = crate::proof_cache::get(&cache_key).await {
+        tracing::info!("Reveal proof cache hit — skipping redundant on-chain verification");
+        return Ok(tx_hash);
+    }
+
     let onchain_table_id = resolve_onchain_table_id(config, table_id);
     let committee_addr = config.committee_address()?;
     let converted_proof = convert_keccak_proof_to_soroban(proof)?;
@@ -149,7 +166,9 @@ pub async fn submit_reveal_proof(
     )
     .await?;
 
-    parse_tx_result(output)
+    let tx_hash = parse_tx_result(output)?;
+    crate::proof_cache::insert(cache_key, tx_hash.clone()).await;
+    Ok(tx_hash)
 }
 
 /// Submit a showdown proof to the on-chain poker-table contract via `submit_showdown`.
@@ -163,6 +182,12 @@ pub async fn submit_showdown_proof(
     if !config.is_configured() {
         tracing::warn!("Soroban not configured, skipping showdown proof submission");
         return Ok(String::new());
+    }
+
+    let cache_key = crate::proof_cache::proof_key(proof, public_inputs);
+    if let Some(tx_hash) = crate::proof_cache::get(&cache_key).await {
+        tracing::info!("Showdown proof cache hit — skipping redundant on-chain verification");
+        return Ok(tx_hash);
     }
 
     let onchain_table_id = resolve_onchain_table_id(config, table_id);
@@ -185,6 +210,8 @@ pub async fn submit_showdown_proof(
             hole_cards_json,
             "--salts".to_string(),
             "[]".to_string(),
+            "--bad_beat_scores".to_string(),
+            "[]".to_string(),
             "--proof".to_string(),
             proof_hex,
             "--public_inputs".to_string(),
@@ -193,7 +220,9 @@ pub async fn submit_showdown_proof(
     )
     .await?;
 
-    parse_tx_result(output)
+    let tx_hash = parse_tx_result(output)?;
+    crate::proof_cache::insert(cache_key, tx_hash.clone()).await;
+    Ok(tx_hash)
 }
 
 /// Convert co-noir keccak proof format to the Soroban/BB UltraHonk verifier format.
@@ -395,7 +424,7 @@ fn convert_keccak_proof_to_soroban(proof_bytes: &[u8]) -> Result<Vec<u8>, String
 /// MPC proof outputs are decimal field element strings.
 fn field_to_bytes32_hex(field_str: &str) -> Result<String, String> {
     let fr = Fr::from_str(field_str)
-        .map_err(|_| format!("failed to parse field element: '{}'", field_str))?;
+        .map_err(|_| format!("invalid field element: {}", field_str))?;
     let bytes = fr.into_bigint().to_bytes_be();
     // Pad to exactly 32 bytes (should already be, but be safe)
     if bytes.len() > 32 {
@@ -420,7 +449,7 @@ fn fields_to_bytes32_json(fields: &[String]) -> Result<String, String> {
 fn public_inputs_to_hex(public_inputs: &[String]) -> Result<String, String> {
     let mut all_bytes = Vec::with_capacity(public_inputs.len() * 32);
     for pi in public_inputs {
-        let fr = Fr::from_str(pi).map_err(|_| format!("failed to parse public input: '{}'", pi))?;
+        let fr = Fr::from_str(pi).map_err(|_| format!("invalid public input: {}", pi))?;
         let bytes = fr.into_bigint().to_bytes_be();
         let mut padded = vec![0u8; 32 - bytes.len()];
         padded.extend_from_slice(&bytes);
@@ -444,9 +473,13 @@ mod error_handling_tests {
             rpc_url: "http://localhost:8000/soroban/rpc".to_string(),
             secret_key: "test_secret".to_string(),
             poker_table_contract: String::new(),
+            committee_registry_contract: String::new(),
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
             onchain_table_id: None,
             player_identities: Vec::new(),
+            committee_member_min_stake: 0,
+            committee_member_endpoint: String::new(),
+            committee_member_region: "us-east-1".to_string(),
         }
     }
 
@@ -498,8 +531,7 @@ mod error_handling_tests {
 
     #[test]
     fn fields_json_rejects_invalid_entry() {
-        let err =
-            fields_to_bytes32_json(&["12".to_string(), "bad-field".to_string()]).unwrap_err();
+        let err = fields_to_bytes32_json(&["12".to_string(), "bad-field".to_string()]).unwrap_err();
         assert!(err.contains("failed to parse field element"), "got: {err}");
     }
 

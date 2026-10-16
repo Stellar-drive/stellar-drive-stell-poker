@@ -5,9 +5,20 @@ members = [
     "contracts/zk-verifier",
     "contracts/committee-registry",
     "contracts/game-hub",
+    "contracts/player-rating",
+    "contracts/auth-manager",
+    "contracts/jackpot-verifier",
+    "contracts/table-nft",
+    "contracts/liquidity-pool",
+    "contracts/tournament-prize-pool",
+    "contracts/protocol-governance",
+    "contracts/rakeback-rewards",
+    "contracts/hand-verifier",
+    "contracts/token-gated-table",
     "stellar-zk-cards",
     "services/coordinator",
     "services/node",
+    "circuits/test-vectors",
 ]
 
 [workspace.dependencies]

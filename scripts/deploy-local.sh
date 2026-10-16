@@ -172,7 +172,7 @@ for circuit in deal_valid reveal_board_valid showdown_valid; do
     if [ -f "$VK_PATH" ]; then
         # Convert BB VK (3680 bytes, limb-encoded) to compact + keccak formats
         echo "  Converting VK for $circuit..."
-        python3 "$PROJECT_DIR/scripts/convert-vk.py" "$VK_PATH" "$VK_COMPACT" "$VK_KECCAK" || {
+        python3 "$PROJECT_DIR/scripts/convert-vk.py" --circuit "$circuit" "$VK_PATH" "$VK_COMPACT" "$VK_KECCAK" || {
             echo "    WARNING: VK conversion failed for $circuit"
             continue
         }
@@ -190,7 +190,8 @@ for circuit in deal_valid reveal_board_valid showdown_valid; do
             -- set_verification_key \
             --admin "$COMMITTEE_ADDRESS" \
             --circuit '"'"$CIRCUIT_TYPE"'"' \
-            --vk_data "$VK_HEX" || echo "    WARNING: VK upload failed for $circuit"
+            --vk_data "$VK_HEX" \
+            --version 1 || echo "    WARNING: VK upload failed for $circuit"
     else
         echo "  SKIP: No VK file at $VK_PATH (compile circuits first)"
     fi
@@ -205,7 +206,7 @@ TABLE_ID=$(stellar contract invoke \
     --network "$NETWORK" \
     -- create_table \
     --admin "$COMMITTEE_ADDRESS" \
-    --config "{\"token\":\"$TOKEN_CONTRACT\",\"min_buy_in\":\"1000000000\",\"max_buy_in\":\"100000000000\",\"small_blind\":\"500000000\",\"big_blind\":\"1000000000\",\"min_players\":2,\"max_players\":$MAX_PLAYERS,\"timeout_ledgers\":100,\"committee\":\"$COMMITTEE_ADDRESS\",\"verifier\":\"$ZK_VERIFIER\",\"game_hub\":\"$GAME_HUB\",\"rake_bps\":0}")
+    --config "{\"token\":\"$TOKEN_CONTRACT\",\"min_buy_in\":\"1000000000\",\"max_buy_in\":\"100000000000\",\"small_blind\":\"500000000\",\"big_blind\":\"1000000000\",\"min_players\":2,\"max_players\":$MAX_PLAYERS,\"timeout_ledgers\":100,\"committee\":\"$COMMITTEE_ADDRESS\",\"verifier\":\"$ZK_VERIFIER\",\"game_hub\":\"$GAME_HUB\",\"rake_bps\":0,\"max_rebuys\":0}")
 echo "  Table ID: $TABLE_ID"
 
 # 10. Mint/wrap XLM for players and have them join

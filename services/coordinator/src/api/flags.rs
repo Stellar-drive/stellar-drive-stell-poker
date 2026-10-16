@@ -9,6 +9,7 @@ use axum::{
     Json,
 };
 use std::collections::HashMap;
+use utoipa::ToSchema;
 
 use crate::AppState;
 
@@ -17,9 +18,15 @@ use crate::AppState;
 /// Returns every flag key currently held in the store, including any
 /// per-table / per-player scoped overrides that were loaded from env vars
 /// or set via the admin endpoint at runtime.
-pub async fn list_flags(
-    State(state): State<AppState>,
-) -> Json<HashMap<String, bool>> {
+#[utoipa::path(
+    get,
+    path = "/api/flags",
+    tag = "Flags",
+    responses(
+        (status = 200, description = "Feature flag snapshot", body = HashMap<String, bool>)
+    )
+)]
+pub async fn list_flags(State(state): State<AppState>) -> Json<HashMap<String, bool>> {
     let snap = state.feature_flags.snapshot().await;
     Json(snap)
 }
@@ -37,6 +44,19 @@ pub async fn list_flags(
 /// ```
 ///
 /// Returns `200 OK` on success, `400 Bad Request` if the key is empty.
+#[utoipa::path(
+    post,
+    path = "/api/flags/{key}",
+    tag = "Flags",
+    params(
+        ("key" = String, Path, description = "Full flag key, e.g. `solo_mode`, `chat_enabled.table.3`")
+    ),
+    request_body = SetFlagBody,
+    responses(
+        (status = 200, description = "Flag updated"),
+        (status = 400, description = "Empty key")
+    )
+)]
 pub async fn set_flag(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -48,4 +68,10 @@ pub async fn set_flag(
     }
     state.feature_flags.set_flag(&key, body.enabled).await;
     StatusCode::OK
+}
+
+/// Request body for `POST /api/flags/:key`.
+#[derive(ToSchema)]
+pub struct SetFlagBody {
+    pub enabled: bool,
 }

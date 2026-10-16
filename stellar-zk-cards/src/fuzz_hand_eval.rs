@@ -8,8 +8,7 @@
 //! Any divergence here would mean the on-chain settlement contract could pick
 //! a different winner than what the ZK proof attests.
 
-extern crate std;
-
+use std::format;
 use crate::evaluate_hand;
 use proptest::prelude::*;
 
@@ -62,9 +61,9 @@ fn circuit_score_five(mut ranks: [u32; 5], suits: [u32; 5]) -> u32 {
 
     let has_two_pairs = ((eq0 && eq2) || (eq0 && eq3) || (eq1 && eq3)) && !has_four;
 
-    let has_pair = (eq0 || eq1 || eq2 || eq3) && !{
-        (eq0 && eq1) || (eq1 && eq2) || (eq2 && eq3)
-    } && !has_two_pairs
+    let has_pair = (eq0 || eq1 || eq2 || eq3)
+        && !{ (eq0 && eq1) || (eq1 && eq2) || (eq2 && eq3) }
+        && !has_two_pairs
         && !has_four;
 
     let tb = (ranks[0] << 16) | (ranks[1] << 12) | (ranks[2] << 8) | (ranks[3] << 4) | ranks[4];
@@ -82,7 +81,11 @@ fn circuit_score_five(mut ranks: [u32; 5], suits: [u32; 5]) -> u32 {
         categorized = true;
     }
     if !categorized && has_four {
-        let four_rank = if eq0 && eq1 && eq2 { ranks[0] } else { ranks[4] };
+        let four_rank = if eq0 && eq1 && eq2 {
+            ranks[0]
+        } else {
+            ranks[4]
+        };
         score = (7 << 20) | (four_rank << 16);
         categorized = true;
     }
@@ -100,10 +103,7 @@ fn circuit_score_five(mut ranks: [u32; 5], suits: [u32; 5]) -> u32 {
         score = (4 << 20) | high;
         categorized = true;
     }
-    if !categorized && {
-        (eq0 && eq1) || (eq1 && eq2) || (eq2 && eq3)
-    } && !has_four
-    {
+    if !categorized && { (eq0 && eq1) || (eq1 && eq2) || (eq2 && eq3) } && !has_four {
         score = (3 << 20) | (three_rank << 16);
         categorized = true;
     }
@@ -134,7 +134,7 @@ fn circuit_score_five(mut ranks: [u32; 5], suits: [u32; 5]) -> u32 {
 }
 
 /// Re-implementation of `evaluate_hand_rank` from `circuits/lib/src/cards.nr`.
-fn circuit_evaluate_hand_rank(cards: [u32; 7]) -> u32 {
+pub(crate) fn circuit_evaluate_hand_rank(cards: [u32; 7]) -> u32 {
     const NUM_RANKS: u32 = 13;
     let mut ranks = [0u32; 7];
     let mut suits = [0u32; 7];
@@ -188,6 +188,32 @@ prop_compose! {
         }
         [deck[0], deck[1], deck[2], deck[3], deck[4], deck[5], deck[6]]
     }
+}
+
+/// libFuzzer-compatible entry point for continuous fuzzing via cargo-fuzz.
+/// This harness finds hand evaluation divergences between contract and circuit implementations.
+#[cfg(fuzzing)]
+pub fn fuzz_hand_evaluator(data: &[u8]) {
+    if data.len() < 7 {
+        return;
+    }
+
+    let mut cards = [0u32; 7];
+    for i in 0..7 {
+        cards[i] = (data[i] as u32) % 52;
+    }
+
+    let contract_rank = evaluate_hand(&cards);
+    let circuit_rank = circuit_evaluate_hand_rank(cards);
+
+    let contract_category = contract_rank.category();
+    let circuit_category = circuit_category(circuit_rank);
+
+    assert_eq!(
+        contract_category, circuit_category,
+        "Hand evaluation divergence: cards={:?}, contract_category={}, circuit_category={}",
+        cards, contract_category, circuit_category
+    );
 }
 
 proptest! {

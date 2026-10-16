@@ -1,3 +1,4 @@
+/** Game Phase shape. */
 export type GamePhase =
   | "waiting"
   | "dealing"
@@ -6,8 +7,13 @@ export type GamePhase =
   | "turn"
   | "river"
   | "showdown"
-  | "settlement";
+  | "settlement"
+  | "awaiting_run_it_twice"
+  | "showdown_run1"
+  | "showdown_run2"
+  | "rit_settlement";
 
+/** Player shape. */
 export interface Player {
   address: string;
   seat: number;
@@ -18,20 +24,42 @@ export interface Player {
   cards?: [number, number];
 }
 
+/** Rit State shape. */
+export interface RitState {
+  active: boolean;
+  player1Seat: number;
+  player2Seat: number;
+  player1OptedIn: boolean;
+  player2OptedIn: boolean;
+  sharedBoardCount: number;
+  currentRun: number;
+  run1BoardIndices: number[];
+  run2BoardIndices: number[];
+  run1Winner: number;
+  run2Winner: number;
+}
+
+/** Game State shape. */
 export interface GameState {
   tableId: number;
   phase: GamePhase;
   players: Player[];
   pot: number;
   boardCards: number[];
+  boardCardsRun2?: number[];
   currentTurn: number;
   dealerSeat: number;
   handNumber: number;
   lastTxHash?: string;
   proofSize?: number;
   onChainConfirmed: boolean;
+  ritState?: RitState;
 }
 
+/** Creates Initial State.
+ * @param tableId - table Id.
+ * @returns GameState.
+ */
 export function createInitialState(tableId: number): GameState {
   return {
     tableId,

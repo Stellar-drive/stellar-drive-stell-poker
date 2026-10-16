@@ -43,10 +43,80 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "big_blind"
+                        "symbol": "betting_structure"
                       },
                       "val": {
-                        "i128": "10"
+                        "vec": [
+                          {
+                            "symbol": "NoLimit"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "blinds_schedule"
+                      },
+                      "val": {
+                        "map": [
+                          {
+                            "key": {
+                              "symbol": "levels"
+                            },
+                            "val": {
+                              "vec": [
+                                {
+                                  "map": [
+                                    {
+                                      "key": {
+                                        "symbol": "ante"
+                                      },
+                                      "val": {
+                                        "vec": [
+                                          {
+                                            "symbol": "None"
+                                          }
+                                        ]
+                                      }
+                                    },
+                                    {
+                                      "key": {
+                                        "symbol": "big_blind"
+                                      },
+                                      "val": {
+                                        "i128": "10"
+                                      }
+                                    },
+                                    {
+                                      "key": {
+                                        "symbol": "break_seconds"
+                                      },
+                                      "val": {
+                                        "u64": "0"
+                                      }
+                                    },
+                                    {
+                                      "key": {
+                                        "symbol": "duration_seconds"
+                                      },
+                                      "val": {
+                                        "u64": "0"
+                                      }
+                                    },
+                                    {
+                                      "key": {
+                                        "symbol": "small_blind"
+                                      },
+                                      "val": {
+                                        "i128": "5"
+                                      }
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          }
+                        ]
                       }
                     },
                     {
@@ -59,10 +129,26 @@
                     },
                     {
                       "key": {
+                        "symbol": "dead_chip_timeout_ledgers"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "game_hub"
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "jackpot_rake_share_bps"
+                      },
+                      "val": {
+                        "u32": 0
                       }
                     },
                     {
@@ -79,6 +165,30 @@
                       },
                       "val": {
                         "u32": 6
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "max_rebuys"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "min_bad_beat_category"
+                      },
+                      "val": {
+                        "u32": 7
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "min_bad_beat_rank"
+                      },
+                      "val": {
+                        "u32": 12
                       }
                     },
                     {
@@ -107,10 +217,22 @@
                     },
                     {
                       "key": {
-                        "symbol": "small_blind"
+                        "symbol": "reclaim_period_ledgers"
                       },
                       "val": {
-                        "i128": "5"
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "street_time_limit"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "symbol": "None"
+                          }
+                        ]
                       }
                     },
                     {
@@ -128,6 +250,12 @@
                       "val": {
                         "address": "CBUSYNQKASUYFWYC3M2GUEDMX4AIVWPALDBYJPNK6554BREHTGZ2IUNF"
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "treasury"
+                      },
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -414,6 +542,99 @@
               "key": {
                 "vec": [
                   {
+                    "symbol": "PlayerTables"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "vec": [
+                  {
+                    "u32": 0
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 518400
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "PlayerTables"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "vec": [
+                  {
+                    "u32": 0
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 518400
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "PlayerTables"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "vec": [
+                  {
+                    "u32": 0
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 518400
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
                     "symbol": "Table"
                   },
                   {
@@ -424,6 +645,14 @@
               "durability": "persistent",
               "val": {
                 "map": [
+                  {
+                    "key": {
+                      "symbol": "action_deadline"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
                   {
                     "key": {
                       "symbol": "admin"
@@ -442,6 +671,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "break_ends_at"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "committee"
                     },
                     "val": {
@@ -456,10 +693,80 @@
                       "map": [
                         {
                           "key": {
-                            "symbol": "big_blind"
+                            "symbol": "betting_structure"
                           },
                           "val": {
-                            "i128": "10"
+                            "vec": [
+                              {
+                                "symbol": "NoLimit"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "blinds_schedule"
+                          },
+                          "val": {
+                            "map": [
+                              {
+                                "key": {
+                                  "symbol": "levels"
+                                },
+                                "val": {
+                                  "vec": [
+                                    {
+                                      "map": [
+                                        {
+                                          "key": {
+                                            "symbol": "ante"
+                                          },
+                                          "val": {
+                                            "vec": [
+                                              {
+                                                "symbol": "None"
+                                              }
+                                            ]
+                                          }
+                                        },
+                                        {
+                                          "key": {
+                                            "symbol": "big_blind"
+                                          },
+                                          "val": {
+                                            "i128": "10"
+                                          }
+                                        },
+                                        {
+                                          "key": {
+                                            "symbol": "break_seconds"
+                                          },
+                                          "val": {
+                                            "u64": "0"
+                                          }
+                                        },
+                                        {
+                                          "key": {
+                                            "symbol": "duration_seconds"
+                                          },
+                                          "val": {
+                                            "u64": "0"
+                                          }
+                                        },
+                                        {
+                                          "key": {
+                                            "symbol": "small_blind"
+                                          },
+                                          "val": {
+                                            "i128": "5"
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              }
+                            ]
                           }
                         },
                         {
@@ -472,10 +779,26 @@
                         },
                         {
                           "key": {
+                            "symbol": "dead_chip_timeout_ledgers"
+                          },
+                          "val": {
+                            "u32": 0
+                          }
+                        },
+                        {
+                          "key": {
                             "symbol": "game_hub"
                           },
                           "val": {
                             "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM"
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "jackpot_rake_share_bps"
+                          },
+                          "val": {
+                            "u32": 0
                           }
                         },
                         {
@@ -492,6 +815,30 @@
                           },
                           "val": {
                             "u32": 6
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "max_rebuys"
+                          },
+                          "val": {
+                            "u32": 0
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "min_bad_beat_category"
+                          },
+                          "val": {
+                            "u32": 7
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "min_bad_beat_rank"
+                          },
+                          "val": {
+                            "u32": 12
                           }
                         },
                         {
@@ -520,10 +867,22 @@
                         },
                         {
                           "key": {
-                            "symbol": "small_blind"
+                            "symbol": "reclaim_period_ledgers"
                           },
                           "val": {
-                            "i128": "5"
+                            "u32": 0
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "street_time_limit"
+                          },
+                          "val": {
+                            "vec": [
+                              {
+                                "symbol": "None"
+                              }
+                            ]
                           }
                         },
                         {
@@ -544,6 +903,12 @@
                         },
                         {
                           "key": {
+                            "symbol": "treasury"
+                          },
+                          "val": "void"
+                        },
+                        {
+                          "key": {
                             "symbol": "verifier"
                           },
                           "val": {
@@ -551,6 +916,14 @@
                           }
                         }
                       ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "current_blind_level"
+                    },
+                    "val": {
+                      "u32": 0
                     }
                   },
                   {
@@ -587,6 +960,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "hand_actions"
+                    },
+                    "val": {
+                      "vec": []
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "hand_commitments"
                     },
                     "val": {
@@ -611,10 +992,34 @@
                   },
                   {
                     "key": {
+                      "symbol": "jackpot_balance"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "last_action_ledger"
                     },
                     "val": {
                       "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "last_raise_size"
+                    },
+                    "val": {
+                      "i128": "10"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "level_started_at"
+                    },
+                    "val": {
+                      "u64": "0"
                     }
                   },
                   {
@@ -679,6 +1084,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "rebuy_count"
+                              },
+                              "val": {
+                                "u32": 0
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "seat_index"
                               },
                               "val": {
@@ -696,6 +1109,14 @@
                             {
                               "key": {
                                 "symbol": "stack"
+                              },
+                              "val": {
+                                "i128": "200"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_buy_in"
                               },
                               "val": {
                                 "i128": "200"
@@ -747,6 +1168,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "rebuy_count"
+                              },
+                              "val": {
+                                "u32": 0
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "seat_index"
                               },
                               "val": {
@@ -764,6 +1193,14 @@
                             {
                               "key": {
                                 "symbol": "stack"
+                              },
+                              "val": {
+                                "i128": "300"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_buy_in"
                               },
                               "val": {
                                 "i128": "300"
@@ -815,6 +1252,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "rebuy_count"
+                              },
+                              "val": {
+                                "u32": 0
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "seat_index"
                               },
                               "val": {
@@ -832,6 +1277,14 @@
                             {
                               "key": {
                                 "symbol": "stack"
+                              },
+                              "val": {
+                                "i128": "500"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_buy_in"
                               },
                               "val": {
                                 "i128": "500"
@@ -860,7 +1313,27 @@
                   },
                   {
                     "key": {
+                      "symbol": "rit_state"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "symbol": "None"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "session_id"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "settlement_entered_ledger"
                     },
                     "val": {
                       "u32": 0
