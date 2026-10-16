@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::{
     anti_dumping, circuit_pins, feature_flags, mpc, mpc_validation, rate_limit, session_cache,
-    session_gc, session_recovery, soroban, AppState, TableSession,
+    session_gc, session_recovery, soroban, submission_ledger, AppState, TableSession,
 };
 use auth::{allow_insecure_dev_auth, enforce_rate_limit, validate_signed_request};
 use parsing::{
@@ -676,26 +676,46 @@ pub async fn request_deal(
             StatusCode::BAD_GATEWAY
         })?;
 
-    let tx_hash = match soroban::submit_deal_proof(
-        &state.soroban_config,
-        table_id,
-        &deal_proof.proof,
-        &deal_proof.public_inputs,
-        &parsed_deal.deck_root,
-        &parsed_deal.hand_commitments,
-    )
-    .await
+    // Issue #592: at-most-once deal submission — skip if already recorded.
+    let tx_hash = if let Ok(Some(cached_hash)) =
+        submission_ledger::check_already_submitted(&state.submission_ledger, &proof_session_id, "deal")
     {
-        Ok(h) if !h.is_empty() => Some(h),
-        Ok(_) => None,
-        Err(e) => {
-            if state.soroban_config.is_configured() {
-                tracing::error!("Soroban deal proof submission failed: {}", e);
-                return Err(StatusCode::BAD_GATEWAY);
+        tracing::info!(
+            session_id = %proof_session_id,
+            "deal proof already submitted — replaying cached tx hash"
+        );
+        Some(cached_hash)
+    } else {
+        let hash = match soroban::submit_deal_proof(
+            &state.soroban_config,
+            table_id,
+            &deal_proof.proof,
+            &deal_proof.public_inputs,
+            &parsed_deal.deck_root,
+            &parsed_deal.hand_commitments,
+        )
+        .await
+        {
+            Ok(h) if !h.is_empty() => Some(h),
+            Ok(_) => None,
+            Err(e) => {
+                if state.soroban_config.is_configured() {
+                    tracing::error!("Soroban deal proof submission failed: {}", e);
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+                tracing::warn!("Soroban deal proof submission skipped/failed: {}", e);
+                None
             }
-            tracing::warn!("Soroban deal proof submission skipped/failed: {}", e);
-            None
+        };
+        if let Some(ref h) = hash {
+            let _ = submission_ledger::record_submission(
+                &state.submission_ledger,
+                &proof_session_id,
+                "deal",
+                h,
+            );
         }
+        hash
     };
 
     let player_card_positions: Vec<(u32, u32)> = (0..players.len())
@@ -945,26 +965,50 @@ pub async fn request_reveal(
             StatusCode::BAD_GATEWAY
         })?;
 
-    let tx_hash = match soroban::submit_reveal_proof(
-        &state.soroban_config,
-        table_id,
-        &reveal_proof.proof,
-        &reveal_proof.public_inputs,
-        &parsed_reveal.cards,
-        &parsed_reveal.indices,
-    )
-    .await
-    {
-        Ok(h) if !h.is_empty() => Some(h),
-        Ok(_) => None,
-        Err(e) => {
-            if state.soroban_config.is_configured() {
-                tracing::error!("Soroban reveal proof submission failed: {}", e);
-                return Err(StatusCode::BAD_GATEWAY);
+    // Issue #592: at-most-once reveal submission — skip if already recorded.
+    let reveal_action = format!("reveal-{}", phase);
+    let tx_hash = if let Ok(Some(cached_hash)) = submission_ledger::check_already_submitted(
+        &state.submission_ledger,
+        &proof_session_id,
+        &reveal_action,
+    ) {
+        tracing::info!(
+            session_id = %proof_session_id,
+            phase = %phase,
+            "reveal proof already submitted — replaying cached tx hash"
+        );
+        Some(cached_hash)
+    } else {
+        let hash = match soroban::submit_reveal_proof(
+            &state.soroban_config,
+            table_id,
+            &reveal_proof.proof,
+            &reveal_proof.public_inputs,
+            &parsed_reveal.cards,
+            &parsed_reveal.indices,
+        )
+        .await
+        {
+            Ok(h) if !h.is_empty() => Some(h),
+            Ok(_) => None,
+            Err(e) => {
+                if state.soroban_config.is_configured() {
+                    tracing::error!("Soroban reveal proof submission failed: {}", e);
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+                tracing::warn!("Soroban reveal proof submission skipped/failed: {}", e);
+                None
             }
-            tracing::warn!("Soroban reveal proof submission skipped/failed: {}", e);
-            None
+        };
+        if let Some(ref h) = hash {
+            let _ = submission_ledger::record_submission(
+                &state.submission_ledger,
+                &proof_session_id,
+                &reveal_action,
+                h,
+            );
         }
+        hash
     };
 
     session
@@ -1164,49 +1208,72 @@ pub async fn request_showdown(
     }
     let winner = session.player_order[parsed_showdown.winner_index as usize].clone();
 
-    let (tx_hash, settled_by_timeout) = match soroban::submit_showdown_proof(
-        &state.soroban_config,
-        table_id,
-        &showdown_proof.proof,
-        &showdown_proof.public_inputs,
-        &parsed_showdown.hole_cards,
-    )
-    .await
-    {
-        Ok(h) if !h.is_empty() => (Some(h), false),
-        Ok(_) => (None, false),
-        Err(e) => {
-            if state.soroban_config.is_configured() {
-                tracing::error!("Soroban showdown proof submission failed: {}", e);
-                match soroban::claim_timeout(&state.soroban_config, table_id).await {
-                    Ok(h) if !h.is_empty() => {
-                        tracing::warn!(
-                            "Showdown proof rejected on-chain; settled table {} via timeout fallback",
-                            table_id
-                        );
-                        (Some(h), true)
+    // Issue #592: at-most-once showdown submission — skip if already recorded.
+    let (tx_hash, settled_by_timeout) = if let Ok(Some(cached_hash)) =
+        submission_ledger::check_already_submitted(
+            &state.submission_ledger,
+            &proof_session_id,
+            "showdown",
+        ) {
+        tracing::info!(
+            session_id = %proof_session_id,
+            "showdown proof already submitted — replaying cached tx hash"
+        );
+        (Some(cached_hash), false)
+    } else {
+        let result = match soroban::submit_showdown_proof(
+            &state.soroban_config,
+            table_id,
+            &showdown_proof.proof,
+            &showdown_proof.public_inputs,
+            &parsed_showdown.hole_cards,
+        )
+        .await
+        {
+            Ok(h) if !h.is_empty() => (Some(h), false),
+            Ok(_) => (None, false),
+            Err(e) => {
+                if state.soroban_config.is_configured() {
+                    tracing::error!("Soroban showdown proof submission failed: {}", e);
+                    match soroban::claim_timeout(&state.soroban_config, table_id).await {
+                        Ok(h) if !h.is_empty() => {
+                            tracing::warn!(
+                                "Showdown proof rejected on-chain; settled table {} via timeout fallback",
+                                table_id
+                            );
+                            (Some(h), true)
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                "Showdown proof rejected on-chain; timeout fallback returned empty hash for table {}",
+                                table_id
+                            );
+                            (None, true)
+                        }
+                        Err(timeout_err) => {
+                            tracing::error!(
+                                "Showdown proof rejected and timeout fallback failed for table {}: {}",
+                                table_id,
+                                timeout_err
+                            );
+                            return Err(StatusCode::BAD_GATEWAY);
+                        }
                     }
-                    Ok(_) => {
-                        tracing::warn!(
-                            "Showdown proof rejected on-chain; timeout fallback returned empty hash for table {}",
-                            table_id
-                        );
-                        (None, true)
-                    }
-                    Err(timeout_err) => {
-                        tracing::error!(
-                            "Showdown proof rejected and timeout fallback failed for table {}: {}",
-                            table_id,
-                            timeout_err
-                        );
-                        return Err(StatusCode::BAD_GATEWAY);
-                    }
+                } else {
+                    tracing::warn!("Soroban showdown proof submission skipped/failed: {}", e);
+                    (None, false)
                 }
-            } else {
-                tracing::warn!("Soroban showdown proof submission skipped/failed: {}", e);
-                (None, false)
             }
+        };
+        if let Some(ref h) = result.0 {
+            let _ = submission_ledger::record_submission(
+                &state.submission_ledger,
+                &proof_session_id,
+                "showdown",
+                h,
+            );
         }
+        result
     };
 
     let is_rit_run1 = session.phase == "showdown_run1";
