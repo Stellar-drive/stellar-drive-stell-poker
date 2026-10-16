@@ -146,3 +146,39 @@ pub enum DataKey {
     Table(u32),
     Paused(u32), // per-table pause flag
 }
+
+/// Stable format version emitted by `export_table_state`.
+pub const TABLE_EXPORT_VERSION: u32 = 1;
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExportSeat {
+    pub seat_index: u32,
+    pub address: Address,
+    pub stack: i128,
+    pub bet_this_round: i128,
+    pub committed: i128,
+    pub folded: bool,
+    pub all_in: bool,
+    pub sitting_out: bool,
+}
+
+/// Versioned full-table snapshot for replay tools (#570).
+///
+/// Field set is frozen at `version == TABLE_EXPORT_VERSION`: stacks,
+/// seats, phase, button (`dealer_seat`) and config. Consumers (e.g. the
+/// hand replayer) must reject unknown `version` values.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TableExportV1 {
+    pub version: u32,
+    pub table_id: u32,
+    pub phase: GamePhase,
+    pub dealer_seat: u32,
+    pub current_turn: u32,
+    pub hand_number: u32,
+    pub pot: i128,
+    pub seats: Vec<ExportSeat>,
+    pub board_cards: Vec<u32>,
+    pub config: TableConfig,
+}

@@ -10,8 +10,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
+
+use crate::cost::SessionCost;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum SessionStatus {
@@ -46,6 +49,12 @@ pub struct MpcSessionState {
     pub proof_path: Option<PathBuf>,
     /// Public inputs emitted by co-noir for the generated proof.
     pub public_inputs: Option<Vec<String>>,
+    /// When the session record was created (for CPU-seconds attribution).
+    pub created_at: Instant,
+    /// Total decoded share-fragment bytes received (#572 cost attribution).
+    pub bytes_in: u64,
+    /// Proof bytes produced (0 until complete).
+    pub bytes_out: u64,
 }
 
 impl MpcSessionState {
@@ -61,7 +70,33 @@ impl MpcSessionState {
             witness_path: None,
             proof_path: None,
             public_inputs: None,
+            created_at: Instant::now(),
+            bytes_in: 0,
+            bytes_out: 0,
         }
+    }
+
+    pub fn status_str(&self) -> String {
+        match &self.status {
+            SessionStatus::SharesReceived => "shares_received".to_string(),
+            SessionStatus::WitnessGenerating => "witness_generating".to_string(),
+            SessionStatus::ProofGenerating => "proof_generating".to_string(),
+            SessionStatus::Complete => "complete".to_string(),
+            SessionStatus::Failed(e) => format!("failed: {}", e),
+        }
+    }
+
+    /// Structured cost snapshot for logs/metrics (#572).
+    pub fn cost_snapshot(&self) -> SessionCost {
+        SessionCost::snapshot(
+            &self.session_id,
+            &self.circuit_name,
+            &self.status_str(),
+            &self.created_at,
+            self.bytes_in,
+            self.bytes_out,
+            self.partial_share_paths.len(),
+        )
     }
 }
 
@@ -94,6 +129,8 @@ pub fn receive_share_fragment(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(share_data_b64)
         .map_err(|e| format!("base64 decode error: {}", e))?;
+
+    session.bytes_in += bytes.len() as u64;
 
     let share_path = session
         .work_dir

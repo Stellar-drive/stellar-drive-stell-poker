@@ -17,10 +17,12 @@ use axum::{
     Router,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 mod api;
+mod cost;
 mod private_table;
 mod session;
 
@@ -34,6 +36,21 @@ pub struct NodeState {
     pub tables: Arc<RwLock<HashMap<u32, PrivateTableState>>>,
     pub party_config_path: String,
     pub peer_http_endpoints: Vec<String>,
+    /// Graceful drain flag for planned maintenance (#571): when true the node
+    /// finishes in-flight sessions but refuses new ones. Advertised via
+    /// GET /health (`draining`) and set via DRAIN_MODE env or POST /admin/drain.
+    pub draining: Arc<AtomicBool>,
+}
+
+fn drain_mode_from_env() -> bool {
+    match std::env::var("DRAIN_MODE") {
+        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        Err(_) => false,
+    }
+}
+
+pub fn is_draining(state: &NodeState) -> bool {
+    state.draining.load(Ordering::SeqCst)
 }
 
 #[tokio::main]
@@ -76,16 +93,25 @@ async fn main() {
     tracing::info!("Party config: {}", party_config_path);
     tracing::info!("Peer HTTP endpoints: {:?}", peer_http_endpoints);
 
+    let draining = Arc::new(AtomicBool::new(drain_mode_from_env()));
+    if draining.load(Ordering::SeqCst) {
+        tracing::warn!(
+            "MPC Node {} starting in DRAIN mode (DRAIN_MODE set)",
+            node_id
+        );
+    }
+
     let state = NodeState {
         node_id,
         sessions: Arc::new(RwLock::new(HashMap::new())),
         tables: Arc::new(RwLock::new(HashMap::new())),
         party_config_path,
         peer_http_endpoints,
+        draining,
     };
 
     let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(api::get_health))
         .route(
             "/table/:table_id/prepare-deal",
             post(api::post_prepare_deal),
@@ -107,6 +133,8 @@ async fn main() {
         .route("/session/:id/generate", post(api::post_generate))
         .route("/session/:id/status", get(api::get_status))
         .route("/session/:id/proof", get(api::get_proof))
+        .route("/session/:id/cost", get(api::get_cost))
+        .route("/admin/drain", post(api::post_admin_drain))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);

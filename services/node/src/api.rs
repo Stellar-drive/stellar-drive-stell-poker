@@ -10,9 +10,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::cost::SessionCost;
 use crate::private_table::{self, DealPreparation, RevealPreparation, ShowdownPreparation};
 use crate::session::{self, MpcSessionState, SessionStatus};
-use crate::NodeState;
+use crate::{is_draining, NodeState};
 
 #[derive(Deserialize)]
 pub struct PrepareDealRequest {
@@ -63,6 +64,64 @@ pub struct PermLookupResponse {
 }
 
 #[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub draining: bool,
+    pub node_id: u32,
+}
+
+#[derive(Deserialize)]
+pub struct DrainRequest {
+    #[serde(default)]
+    pub draining: bool,
+}
+
+#[derive(Serialize)]
+pub struct DrainResponse {
+    pub draining: bool,
+}
+
+/// GET /health — includes drain state for coordinator heartbeats (#571).
+pub async fn get_health(State(state): State<NodeState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        draining: is_draining(&state),
+        node_id: state.node_id,
+    })
+}
+
+/// POST /admin/drain — toggle graceful drain mode for planned maintenance.
+///
+/// Body: `{"draining": true|false}`. While draining, the node finishes
+/// in-flight sessions (status/proof/generate keep working) but refuses new
+/// ones (prepare-*, new session shares) with 503.
+pub async fn post_admin_drain(
+    State(state): State<NodeState>,
+    Json(req): Json<DrainRequest>,
+) -> Json<DrainResponse> {
+    use std::sync::atomic::Ordering;
+    state.draining.store(req.draining, Ordering::SeqCst);
+    if req.draining {
+        tracing::warn!("MPC Node {} entered DRAIN mode", state.node_id);
+    } else {
+        tracing::info!("MPC Node {} left DRAIN mode", state.node_id);
+    }
+    Json(DrainResponse {
+        draining: req.draining,
+    })
+}
+
+fn reject_if_draining(state: &NodeState) -> Result<(), (StatusCode, String)> {
+    if is_draining(state) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node is draining, refusing new sessions".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
 pub struct StatusResponse {
     pub session_id: String,
     pub status: String,
@@ -82,6 +141,7 @@ pub async fn post_prepare_deal(
     Path(table_id): Path<u32>,
     Json(req): Json<PrepareDealRequest>,
 ) -> Result<Json<DealPreparation>, (StatusCode, String)> {
+    reject_if_draining(&state)?;
     let mut seen = HashSet::new();
     for player in &req.players {
         if player.trim().is_empty() {
@@ -117,6 +177,7 @@ pub async fn post_prepare_reveal(
     Path((table_id, phase)): Path<(u32, String)>,
     Json(req): Json<PrepareRevealRequest>,
 ) -> Result<Json<RevealPreparation>, (StatusCode, String)> {
+    reject_if_draining(&state)?;
     let mut tables = state.tables.write().await;
     let prepared = private_table::prepare_reveal(
         table_id,
@@ -141,6 +202,7 @@ pub async fn post_prepare_showdown(
     Path(table_id): Path<u32>,
     Json(req): Json<PrepareShowdownRequest>,
 ) -> Result<Json<ShowdownPreparation>, (StatusCode, String)> {
+    reject_if_draining(&state)?;
     let mut tables = state.tables.write().await;
     let prepared = private_table::prepare_showdown(
         table_id,
@@ -252,6 +314,9 @@ pub async fn post_shares(
         if let Some(existing) = sessions.get(&session_id) {
             existing.clone()
         } else {
+            // New session while draining: refuse so the node can drain for
+            // planned maintenance. In-flight sessions (existing IDs) continue.
+            reject_if_draining(&state)?;
             let work_dir = tempfile::tempdir()
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tmpdir: {}", e)))?;
             let work_path = work_dir.keep();
@@ -346,12 +411,34 @@ pub async fn post_generate(
                 }
                 session.proof_path = Some(proof_path);
                 session.public_inputs = Some(public_inputs);
+                session.bytes_out = proof_bytes.len() as u64;
                 session.status = SessionStatus::Complete;
-                tracing::info!("[{}] Proof generation complete (node {})", sid, node_id);
+                let cost = session.cost_snapshot();
+                tracing::info!(
+                    session_id = %sid,
+                    circuit = %cost.circuit_name,
+                    status = %cost.status,
+                    cpu_seconds = cost.cpu_seconds,
+                    bytes_in = cost.bytes_in,
+                    bytes_out = cost.bytes_out,
+                    fragments = cost.fragments,
+                    node = node_id,
+                    "MPC session cost attribution"
+                );
             }
             Err(e) => {
                 session.status = SessionStatus::Failed(e.clone());
-                tracing::error!("[{}] Proof generation failed: {}", sid, e);
+                let cost = session.cost_snapshot();
+                tracing::error!(
+                    session_id = %sid,
+                    circuit = %cost.circuit_name,
+                    cpu_seconds = cost.cpu_seconds,
+                    bytes_in = cost.bytes_in,
+                    bytes_out = cost.bytes_out,
+                    node = node_id,
+                    "MPC session failed: {}",
+                    e
+                );
             }
         }
     });
@@ -418,4 +505,15 @@ pub struct ProofResponse {
     pub session_id: String,
     pub proof: String, // base64-encoded proof bytes
     pub public_inputs: Vec<String>,
+}
+
+/// GET /session/:id/cost — per-session resource accounting (#572).
+pub async fn get_cost(
+    State(state): State<NodeState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<SessionCost>, StatusCode> {
+    let sessions = state.sessions.read().await;
+    let session_lock = sessions.get(&session_id).ok_or(StatusCode::NOT_FOUND)?;
+    let session = session_lock.read().await;
+    Ok(Json(session.cost_snapshot()))
 }

@@ -33,7 +33,10 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::{RwLock, Mutex};
 use tower_http::cors::CorsLayer;
 use serde::Serialize;
-use prometheus::{Encoder, TextEncoder, Registry, Opts, HistogramOpts, HistogramVec, IntCounterVec, Gauge};
+use prometheus::{
+    Encoder, TextEncoder, Registry, Opts, HistogramOpts, HistogramVec, IntCounterVec, Gauge,
+    GaugeVec,
+};
 use sysinfo::{get_current_pid, ProcessesToUpdate, System};
 
 mod api;
@@ -81,6 +84,9 @@ pub struct MpcNodeHealth {
     pub endpoint: String,
     pub connected: bool,
     pub last_heartbeat: Option<SystemTime>,
+    /// True when the node advertises drain mode for planned maintenance (#571).
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Clone)]
@@ -91,6 +97,8 @@ pub struct PrometheusMetrics {
     pub request_latency: HistogramVec,
     pub process_cpu_percent: Gauge,
     pub process_memory_bytes: Gauge,
+    /// 1 when the node reports draining, 0 otherwise (label: endpoint).
+    pub node_draining: GaugeVec,
 }
 
 #[derive(Clone)]
@@ -219,6 +227,7 @@ async fn main() {
             endpoint: ep.clone(),
             connected: false,
             last_heartbeat: None,
+            draining: false,
         })
         .collect::<Vec<_>>();
 
@@ -256,6 +265,14 @@ async fn main() {
         ),
     )
     .unwrap();
+    let node_draining = GaugeVec::new(
+        Opts::new(
+            "coordinator_mpc_node_draining",
+            "1 when the MPC node advertises drain mode, 0 otherwise.",
+        ),
+        &["endpoint"],
+    )
+    .unwrap();
 
     prometheus_registry
         .register(Box::new(request_counter.clone()))
@@ -272,6 +289,9 @@ async fn main() {
     prometheus_registry
         .register(Box::new(process_memory_bytes.clone()))
         .unwrap();
+    prometheus_registry
+        .register(Box::new(node_draining.clone()))
+        .unwrap();
 
     let metrics = MetricsState {
         boot_time: Instant::now(),
@@ -285,6 +305,7 @@ async fn main() {
             request_latency,
             process_cpu_percent: process_cpu_percent.clone(),
             process_memory_bytes: process_memory_bytes.clone(),
+            node_draining: node_draining.clone(),
         },
     };
 
@@ -362,27 +383,47 @@ async fn main() {
     // Spawn background node health check task
     let node_endpoints = state.mpc_config.node_endpoints.clone();
     let node_healths = state.metrics.node_healths.clone();
+    let node_draining_gauge = state.metrics.prometheus.node_draining.clone();
     tokio::spawn(async move {
         loop {
             for (idx, endpoint) in node_endpoints.iter().enumerate() {
                 let url = format!("{}/health", endpoint);
-                let is_healthy = reqwest::get(&url)
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
+                // Nodes advertise `{status, draining, node_id}` (#571); older
+                // nodes reply plain "ok", which parses as not-draining.
+                let (is_healthy, is_draining) = match reqwest::get(&url).await {
+                    Ok(resp) if resp.status().is_success() => {
+                        let draining = resp
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| v.get("draining").and_then(|d| d.as_bool()))
+                            .unwrap_or(false);
+                        (true, draining)
+                    }
+                    _ => (false, false),
+                };
                 
                 let mut guard = node_healths.lock().await;
                 if idx < guard.len() {
                     let prev_connected = guard[idx].connected;
+                    let prev_draining = guard[idx].draining;
                     if is_healthy {
                         guard[idx].connected = true;
                         guard[idx].last_heartbeat = Some(SystemTime::now());
+                        guard[idx].draining = is_draining;
+                        if is_draining && !prev_draining {
+                            tracing::warn!("MPC Node {} ({}) entered DRAIN mode", idx, endpoint);
+                        }
                     } else {
                         if prev_connected {
                             tracing::warn!("MPC Node {} ({}) went offline", idx, endpoint);
                         }
                         guard[idx].connected = false;
+                        guard[idx].draining = false;
                     }
+                    node_draining_gauge
+                        .with_label_values(&[endpoint.as_str()])
+                        .set(if guard[idx].draining { 1.0 } else { 0.0 });
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
