@@ -85,6 +85,7 @@ mod session_migration;
 mod session_recovery;
 mod soroban;
 mod spectators;
+mod submission_ledger;
 mod stats;
 mod telemetry;
 mod tls_client;
@@ -414,6 +415,9 @@ struct AppState {
     /// A session ID that has already been used is rejected to prevent replay
     /// attacks on deal/reveal/showdown proofs.
     used_session_ids: Arc<RwLock<HashSet<String>>>,
+    /// At-most-once Soroban proof submission ledger (Issue #592).
+    /// Prevents duplicate on-chain submissions on coordinator retries.
+    submission_ledger: submission_ledger::SubmissionLedgerStore,
     /// Anti-chip-dumping detector fed with settled hand outcomes (Issue #504).
     /// Kept as `Arc<Mutex<_>>` because it is mutated from showdown handlers and
     /// read by the admin report endpoint.
@@ -825,6 +829,10 @@ async fn main() {
         benchmark_store,
         committee_key_rotation,
         used_session_ids: Arc::new(RwLock::new(HashSet::new())),
+        submission_ledger: submission_ledger::new_store(
+            &std::env::var("SUBMISSION_LEDGER_DB_PATH")
+                .unwrap_or_else(|_| "./data/submission_ledger.db".to_string()),
+        ),
         anti_dumping: Arc::new(std::sync::Mutex::new(
             anti_dumping::DumpingDetector::with_default_config(),
         )),
