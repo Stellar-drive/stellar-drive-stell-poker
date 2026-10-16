@@ -36,3 +36,10 @@ stellar-strkey = "0.0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "mpc_message_size"
+harness = false

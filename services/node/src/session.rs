@@ -518,6 +518,16 @@ pub async fn run_proof_generation(
     let public_inputs: Vec<String> = serde_json::from_slice(&public_inputs_bytes)
         .map_err(|e| format!("failed to parse public inputs json: {}", e))?;
 
+    // #579: cache the generated proof keyed by (circuit, artifact hash,
+    // public_inputs), so a caller retrying this exact phase with the same
+    // public inputs in hand can skip re-running MPC generation entirely.
+    // Best-effort: a hashing failure (e.g. artifact moved) must not fail an
+    // otherwise-successful proof generation.
+    if let Ok(artifact_hash) = crate::proof_cache::circuit_artifact_hash(&circuit_dir, &circuit_name) {
+        let key = crate::proof_cache::cache_key(&circuit_name, &artifact_hash, &public_inputs);
+        crate::proof_cache::insert(key, proof_bytes.clone()).await;
+    }
+
     Ok((proof_bytes, public_inputs))
 }
 
