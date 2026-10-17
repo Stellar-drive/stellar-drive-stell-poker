@@ -55,6 +55,8 @@ pub mod crypto;
 mod dashboard;
 mod db;
 mod discovery;
+mod drain;
+mod errors;
 mod feature_flags;
 mod hot_reload;
 mod idempotency;
@@ -92,6 +94,10 @@ mod submission_ledger;
 mod stats;
 mod telemetry;
 mod tls_client;
+mod vk_rollout;
+
+/// Re-exported so downstream modules can refer to `crate::MpcNodeProgress`.
+pub use api::types::MpcNodeProgress;
 mod tournament;
 mod transcript_log;
 
@@ -160,6 +166,10 @@ struct HealthResponse {
     pub contract_deployment: ContractDeployment,
     pub active_mpc_sessions: usize,
     pub request_metrics: HashMap<String, RouteMetric>,
+    /// True while the operator has put the coordinator into maintenance mode.
+    pub maintenance_mode: bool,
+    /// True while the coordinator is draining for a blue-green cutover.
+    pub draining: bool,
     pub maintenance_mode: bool,
 }
 
@@ -220,6 +230,7 @@ struct HealthResponse {
         api::types::TransferChipsResponse,
         api::types::MpcNodeProgress,
         api::types::TableMpcStatusResponse,
+        crate::errors::ErrorBody,
     )),
     tags(
         (name = "Health", description = "Health check and monitoring endpoints"),
@@ -535,6 +546,14 @@ struct AppState {
     /// A session ID that has already been used is rejected to prevent replay
     /// attacks on deal/reveal/showdown proofs.
     used_session_ids: Arc<RwLock<HashSet<String>>>,
+    /// Archived MPC sessions (Issue #259) served by the admin archive endpoints.
+    archive_store: archiver::ArchiveStore,
+    /// Archive retention/purge policy.
+    archive_config: archiver::ArchiveConfig,
+    /// Blue-green drain state (Issue #340).
+    drain: drain::DrainState,
+    /// Verification-key / circuit rollout policy.
+    vk_rollout: vk_rollout::RolloutState,
     /// At-most-once Soroban proof submission ledger (Issue #592).
     /// Prevents duplicate on-chain submissions on coordinator retries.
     submission_ledger: submission_ledger::SubmissionLedgerStore,
@@ -900,6 +919,13 @@ async fn main() {
     let archive_store = archiver::new_store();
     archiver::load_existing_archives(&archive_store, &archive_config).await;
 
+    // Verification-key / circuit rollout policy: pins a circuit version per
+    // circuit kind and optionally canaries a percentage of tables onto the next
+    // version, with per-version proof metrics and an auto-promote/rollback
+    // switch (config from `VK_ROLLOUT_CONFIG`, default `./vk-rollout.json`).
+    let vk_rollout = vk_rollout::RolloutState::from_env(&metrics.prometheus.registry);
+    let drain_state = drain::DrainState::new();
+
     // Committee identity rotation (Issue #102): bootstrap from the
     // already-configured COMMITTEE_SECRET so an existing on-chain
     // registration is treated as the initial "active" key.
@@ -967,6 +993,10 @@ async fn main() {
         benchmark_store,
         committee_key_rotation,
         used_session_ids: Arc::new(RwLock::new(HashSet::new())),
+        archive_store,
+        archive_config,
+        drain: drain_state,
+        vk_rollout,
         submission_ledger: submission_ledger::new_store(
             &std::env::var("SUBMISSION_LEDGER_DB_PATH")
                 .unwrap_or_else(|_| "./data/submission_ledger.db".to_string()),
@@ -1121,8 +1151,8 @@ async fn main() {
     archiver::spawn_archive_task(
         state.mpc_sessions.clone(),
         Arc::clone(&state.tables),
-        archive_store.clone(),
-        archive_config,
+        state.archive_store.clone(),
+        state.archive_config.clone(),
     );
 
     // Spawn background node health check task
@@ -1250,6 +1280,11 @@ async fn main() {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         }
     });
+
+    // Snapshot drain state + active-session counter for the shutdown task
+    // (the `state` itself is moved into the router below).
+    let shutdown_drain = state.drain.clone();
+    let shutdown_active = state.metrics.active_mpc_sessions.clone();
 
     let app = Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
@@ -1424,6 +1459,25 @@ async fn main() {
             get(api::admin_get_archive),
         )
         .route("/api/admin/archives/purge", post(api::admin_purge_archives))
+        // Readiness probe for blue-green cutover (Issue #340): unlike
+        // `/api/health`, returns 503 while draining/maintenance.
+        .route("/api/readyz", get(api::readiness))
+        // Drain protocol + maintenance toggle (Issue #340).
+        .route(
+            "/api/admin/drain",
+            get(api::admin_drain_status)
+                .post(api::admin_start_drain)
+                .delete(api::admin_cancel_drain),
+        )
+        // Circuit (VK) rollout administration.
+        .route("/api/admin/vk-rollout", get(api::admin_rollout_status))
+        .route(
+            "/api/admin/vk-rollout/rollback",
+            post(api::admin_rollout_rollback),
+        )
+        .route(
+            "/api/admin/vk-rollout/promote",
+            post(api::admin_rollout_promote),
         .route(
             "/api/admin/anti-dumping/reports",
             get(api::admin_anti_dumping_reports),
@@ -1466,6 +1520,10 @@ async fn main() {
             idempotency::idempotency_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
+            state.drain.clone(),
+            drain::drain_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             maintenance_middleware,
         ))
@@ -1487,13 +1545,58 @@ async fn main() {
         ))
         .layer(build_cors_layer(state.db_pool.as_deref()).await)
         .layer(middleware::from_fn(api_version::rewrite_and_tag_version))
+        // Outermost: give every error response a stable machine-readable code.
+        .layer(middleware::from_fn(errors::error_response_middleware))
         .with_state(state);
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     tracing::info!("Coordinator listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_drain, shutdown_active))
+        .await
+        .unwrap();
+}
+
+/// Wait for SIGTERM/SIGINT, enter drain mode, then give in-flight MPC sessions
+/// a bounded window to finish before the process exits (blue-green drain,
+/// Issue #340). The window is `DRAIN_TIMEOUT_SECS` (default 30s).
+async fn shutdown_signal(
+    drain: drain::DrainState,
+    active_sessions: Arc<AtomicUsize>,
+) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::warn!("Received Ctrl+C — beginning graceful shutdown"),
+        _ = terminate => tracing::warn!("Received SIGTERM — beginning graceful shutdown"),
+    }
+
+    let grace = drain::DrainState::grace_secs_from_env();
+    drain.begin("shutdown signal", grace).await;
+    let remaining = drain.wait_for_sessions(active_sessions).await;
+    if remaining > 0 {
+        tracing::warn!(
+            "Shutting down with {} in-flight MPC session(s) past the grace window",
+            remaining
+        );
+    }
 }
 
 async fn build_cors_layer(db_pool: Option<&sqlx::PgPool>) -> CorsLayer {
@@ -1582,6 +1685,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let active_mpc_sessions = state.metrics.active_mpc_sessions.load(Ordering::SeqCst);
     let request_metrics = state.metrics.route_metrics.lock().await.clone();
     let maintenance_mode = state.maintenance_mode.load(Ordering::Relaxed);
+    let draining = state.drain.is_draining();
 
     let contract_deployment = ContractDeployment {
         configured: state.soroban_config.is_configured(),
@@ -1599,6 +1703,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         active_mpc_sessions,
         request_metrics,
         maintenance_mode,
+        draining,
     })
 }
 
@@ -1606,14 +1711,14 @@ async fn maintenance_middleware(
     State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
-) -> Result<Response, axum::http::StatusCode> {
+) -> Response {
     if state.maintenance_mode.load(Ordering::Relaxed) {
         let path = req.uri().path();
         if !path.starts_with("/api/admin") {
-            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            return errors::ApiError::new("maintenance").into_response();
         }
     }
-    Ok(next.run(req).await)
+    next.run(req).await
 }
 
 async fn metrics_middleware(
