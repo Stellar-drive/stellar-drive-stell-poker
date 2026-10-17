@@ -26,7 +26,8 @@ use uuid::Uuid;
 
 use crate::{
     anti_dumping, circuit_pins, feature_flags, mpc, mpc_validation, rate_limit, session_cache,
-    session_gc, session_recovery, soroban, submission_ledger, AppState, TableSession,
+    session_gc, session_recovery, soroban, try_admit_mpc_session, AppState, PrometheusMetrics,
+    TableSession,
 };
 use auth::{allow_insecure_dev_auth, enforce_rate_limit, validate_signed_request};
 use parsing::{
@@ -139,12 +140,30 @@ async fn attempt_partial_recovery(
 
 pub struct SessionGuard {
     counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    metrics: PrometheusMetrics,
+    node_endpoints: Vec<String>,
+    started_at: std::time::Instant,
+    successful: bool,
 }
 
 impl SessionGuard {
-    pub fn new(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    pub fn new(
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        metrics: &PrometheusMetrics,
+        node_endpoints: &[String],
+    ) -> Self {
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self { counter }
+        Self {
+            counter,
+            metrics: metrics.clone(),
+            node_endpoints: node_endpoints.to_vec(),
+            started_at: std::time::Instant::now(),
+            successful: false,
+        }
+    }
+
+    pub fn mark_success(&mut self) {
+        self.successful = true;
     }
 }
 
@@ -152,6 +171,18 @@ impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.counter
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let duration = self.started_at.elapsed().as_secs_f64();
+        for (index, _) in self.node_endpoints.iter().enumerate() {
+            self.metrics
+                .mpc_prove_duration_seconds
+                .with_label_values(&[&index.to_string()])
+                .observe(duration);
+        }
+        if self.successful {
+            self.metrics.mpc_session_success_total.inc();
+        } else {
+            self.metrics.mpc_session_errors_total.inc();
+        }
     }
 }
 
@@ -298,7 +329,7 @@ pub async fn create_table(
             .insert(auth.address, creator_seat);
     }
 
-    let selected_node_endpoints = select_mpc_nodes(&state, req.region).await?;
+    let selected_node_endpoints = select_mpc_nodes(&state, table_id, req.region).await?;
 
     let table_view = fetch_onchain_table_view(&state.soroban_config, table_id)
         .await
@@ -583,7 +614,7 @@ pub async fn request_deal(
         existing
     } else {
         // This case shouldn't happen if create_table was called, but for robustness:
-        let selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+        let selected_node_endpoints = select_mpc_nodes(&state, table_id, None).await?;
         let new_session = TableSession {
             table_id,
             deck_root: String::new(),
@@ -654,7 +685,14 @@ pub async fn request_deal(
             return Err(StatusCode::CONFLICT);
         }
     }
-    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
+    if !try_admit_mpc_session(&state.metrics.prometheus) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut _guard = SessionGuard::new(
+        state.metrics.active_mpc_sessions.clone(),
+        &state.metrics.prometheus,
+        &node_endpoints,
+    );
     let deal_circuit = parameterised_circuit_name(&req.circuit_name, players.len());
     deal_span.record("circuit", deal_circuit.as_str());
     deal_span.record("proof_session_id", proof_session_id.as_str());
@@ -669,7 +707,10 @@ pub async fn request_deal(
     )
     .await
     {
-        Ok(proof) => proof,
+        Ok(proof) => {
+            _guard.mark_success();
+            proof
+        }
         Err(e) => {
             tracing::error!("Deal proof generation failed: {}", e);
             // Issue #96: a committee node that went down mid-session can't be
@@ -826,7 +867,7 @@ pub async fn request_reveal(
     let session = tables.get_mut(&table_id).ok_or(StatusCode::NOT_FOUND)?;
 
     if session.selected_node_endpoints.is_empty() {
-        session.selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+        session.selected_node_endpoints = select_mpc_nodes(&state, table_id, None).await?;
     }
     let node_endpoints = session.selected_node_endpoints.clone();
 
@@ -938,7 +979,14 @@ pub async fn request_reveal(
         }
     }
     reveal_span.record("proof_session_id", proof_session_id.as_str());
-    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
+    if !try_admit_mpc_session(&state.metrics.prometheus) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut _guard = SessionGuard::new(
+        state.metrics.active_mpc_sessions.clone(),
+        &state.metrics.prometheus,
+        &node_endpoints,
+    );
     let reveal_proof = match mpc::generate_proof_from_share_sets(
         &state.mpc_client,
         table_id,
@@ -950,7 +998,10 @@ pub async fn request_reveal(
     )
     .await
     {
-        Ok(proof) => proof,
+        Ok(proof) => {
+            _guard.mark_success();
+            proof
+        }
         Err(e) => {
             tracing::error!("Reveal proof generation failed: {}", e);
             // Issue #96: see the deal-proof call site above. Issue #235:
@@ -1076,7 +1127,7 @@ pub async fn request_showdown(
     let session = tables.get_mut(&table_id).ok_or(StatusCode::NOT_FOUND)?;
 
     if session.selected_node_endpoints.is_empty() {
-        session.selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+        session.selected_node_endpoints = select_mpc_nodes(&state, table_id, None).await?;
     }
     let node_endpoints = session.selected_node_endpoints.clone();
 
@@ -1175,7 +1226,14 @@ pub async fn request_showdown(
     let showdown_circuit = parameterised_circuit_name("showdown_valid", session.player_order.len());
     showdown_span.record("circuit", showdown_circuit.as_str());
     showdown_span.record("proof_session_id", proof_session_id.as_str());
-    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
+    if !try_admit_mpc_session(&state.metrics.prometheus) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut _guard = SessionGuard::new(
+        state.metrics.active_mpc_sessions.clone(),
+        &state.metrics.prometheus,
+        &node_endpoints,
+    );
     let showdown_proof = match mpc::generate_proof_from_share_sets(
         &state.mpc_client,
         table_id,
@@ -1187,7 +1245,10 @@ pub async fn request_showdown(
     )
     .await
     {
-        Ok(proof) => proof,
+        Ok(proof) => {
+            _guard.mark_success();
+            proof
+        }
         Err(e) => {
             tracing::error!("Showdown proof generation failed: {}", e);
             // Issue #96: see the deal-proof call site above. Issue #235:
@@ -1800,7 +1861,7 @@ pub async fn get_player_cards(
 
     let mut node_endpoints = session.selected_node_endpoints.clone();
     if node_endpoints.is_empty() {
-        node_endpoints = select_mpc_nodes(&state, None).await?;
+        node_endpoints = select_mpc_nodes(&state, table_id, None).await?;
     }
     let positions = vec![*pos1, *pos2];
     let hand_commitment = session.hand_commitments.get(player_index).cloned();

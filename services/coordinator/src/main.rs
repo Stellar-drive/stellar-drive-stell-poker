@@ -259,6 +259,11 @@ pub struct PrometheusMetrics {
     /// CSP violations by sanitized `effective_directive` and `disposition`
     /// labels (issue #136).
     pub csp_violations_total: IntCounterVec,
+    pub mpc_session_success_total: IntCounter,
+    pub mpc_session_errors_total: IntCounter,
+    pub mpc_session_refusals_total: IntCounter,
+    pub mpc_prove_duration_seconds: HistogramVec,
+    pub memory_watermark_bytes: Gauge,
 }
 
 impl PrometheusMetrics {
@@ -329,6 +334,35 @@ impl PrometheusMetrics {
             &["effective_directive", "disposition"],
         )
         .unwrap();
+        let mpc_session_success_total = IntCounter::new(
+            "coordinator_mpc_session_success_total",
+            "MPC proof sessions completed successfully.",
+        )
+        .unwrap();
+        let mpc_session_errors_total = IntCounter::new(
+            "coordinator_mpc_session_errors_total",
+            "MPC proof sessions that ended with an error.",
+        )
+        .unwrap();
+        let mpc_session_refusals_total = IntCounter::new(
+            "coordinator_mpc_session_refusals_total",
+            "New MPC sessions refused at the memory watermark.",
+        )
+        .unwrap();
+        let mpc_prove_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "coordinator_mpc_prove_duration_seconds",
+                "MPC proof duration by committee node.",
+            )
+            .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0]),
+            &["node_id"],
+        )
+        .unwrap();
+        let memory_watermark_bytes = Gauge::with_opts(Opts::new(
+            "coordinator_memory_watermark_bytes",
+            "Configured process memory watermark for new MPC sessions.",
+        ))
+        .unwrap();
 
         registry
             .register(Box::new(request_counter.clone()))
@@ -357,6 +391,21 @@ impl PrometheusMetrics {
         registry
             .register(Box::new(csp_violations_total.clone()))
             .unwrap();
+        registry
+            .register(Box::new(mpc_session_success_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_session_errors_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_session_refusals_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_prove_duration_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(memory_watermark_bytes.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -369,7 +418,57 @@ impl PrometheusMetrics {
             csp_reports_total,
             csp_reports_rejected_total,
             csp_violations_total,
+            mpc_session_success_total,
+            mpc_session_errors_total,
+            mpc_session_refusals_total,
+            mpc_prove_duration_seconds,
+            memory_watermark_bytes,
         }
+    }
+}
+
+pub(crate) fn memory_watermark_bytes() -> u64 {
+    std::env::var("COORDINATOR_MEMORY_WATERMARK_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn try_admit_mpc_session(metrics: &PrometheusMetrics) -> bool {
+    let watermark = metrics.memory_watermark_bytes.get() as u64;
+    let current = metrics.process_memory_bytes.get() as u64;
+    if watermark > 0 && current >= watermark {
+        metrics.mpc_session_refusals_total.inc();
+        tracing::warn!(current_bytes = current, watermark_bytes = watermark,
+            "refusing new MPC session at memory watermark");
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+mod memory_admission_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_new_session_at_watermark() {
+        let metrics = PrometheusMetrics::new();
+        metrics.memory_watermark_bytes.set(100.0);
+        metrics.process_memory_bytes.set(100.0);
+
+        assert!(!try_admit_mpc_session(&metrics));
+        assert_eq!(metrics.mpc_session_refusals_total.get(), 1);
+    }
+
+    #[test]
+    fn admits_new_session_below_watermark() {
+        let metrics = PrometheusMetrics::new();
+        metrics.memory_watermark_bytes.set(100.0);
+        metrics.process_memory_bytes.set(99.0);
+
+        assert!(try_admit_mpc_session(&metrics));
+        assert_eq!(metrics.mpc_session_refusals_total.get(), 0);
     }
 }
 
@@ -478,6 +577,8 @@ struct MpcConfig {
     /// (vs. built-in localhost defaults). When true, dynamic node discovery is
     /// disabled and these static endpoints are used (backward compatibility).
     static_endpoints_configured: bool,
+    /// Opt-in deterministic table-to-committee affinity for larger committees.
+    table_affinity_enabled: bool,
     /// Path to compiled Noir circuits (ACIR)
     circuit_dir: String,
     /// Soroban RPC endpoint
@@ -594,6 +695,9 @@ async fn main() {
             std::env::var("MPC_NODE_2").unwrap_or_else(|_| "http://localhost:8103".to_string()),
         ],
         static_endpoints_configured,
+        table_affinity_enabled: std::env::var("MPC_TABLE_AFFINITY_ENABLED")
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false),
         circuit_dir: std::env::var("CIRCUIT_DIR").unwrap_or_else(|_| "./circuits".to_string()),
         soroban_rpc: std::env::var("SOROBAN_RPC")
             .unwrap_or_else(|_| "http://localhost:8000/soroban/rpc".to_string()),
@@ -638,6 +742,10 @@ async fn main() {
         node_healths: Arc::new(Mutex::new(initial_node_healths)),
         prometheus: PrometheusMetrics::new(),
     };
+    metrics
+        .prometheus
+        .memory_watermark_bytes
+        .set(memory_watermark_bytes() as f64);
 
     let system_state = Arc::new(Mutex::new(System::new_all()));
     let mpc_sessions: session_gc::SessionStore =
@@ -1836,7 +1944,23 @@ async fn negotiate_version(
         .unwrap_or_default();
     let circuit_refs: Vec<&str> = circuit_names.iter().map(|s| s.as_str()).collect();
 
-    mpc_version::negotiate_session(&state.version_registry, &node_ids, &circuit_refs)
+    let channel = params
+        .get("channel")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .or_else(|| std::env::var("COORDINATOR_RELEASE_CHANNEL").ok())
+        .unwrap_or_else(|| "stable".to_string());
+    let channel = match channel.as_str() {
+        "stable" => mpc_version::ReleaseChannel::Stable,
+        "canary" => mpc_version::ReleaseChannel::Canary,
+        _ => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "channel must be stable or canary".to_string(),
+            ))
+        }
+    };
+
+    mpc_version::negotiate_session(&state.version_registry, &node_ids, &circuit_refs, channel)
         .await
         .map(Json)
         .map_err(|e| (axum::http::StatusCode::CONFLICT, e))
