@@ -1,5 +1,7 @@
 # Stellar Poker
 
+See the contribution guide for issue follow-up workflow.
+
 [![CI](https://github.com/Stellar-drive/stellar-drive-stell-poker/actions/workflows/ci.yml/badge.svg)](https://github.com/Stellar-drive/stellar-drive-stell-poker/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -107,6 +109,17 @@ stellar-poker/
 - Docker
 - Stellar CLI — `cargo install stellar-cli --features opt`
 - co-noir (for CRS download) — `cargo install --git https://github.com/TaceoLabs/co-snarks co-noir`
+
+New here? [docs/developer-onboarding.md](docs/developer-onboarding.md) is a
+step-by-step checklist from clone to a passing test hand.
+
+Nix users can get the toolchain in one command:
+
+```bash
+nix develop
+```
+
+See [flake.nix](flake.nix).
 
 ## Quick Start
 
@@ -400,4 +413,7 @@ export function CreateTableButton() {
 - [Noir Testing Guide](docs/NOIR_TESTING_GUIDE.md)
 - [Local Committee Development Guide](docs/local-committee-dev-guide.md)
 - [Soroban Storage Optimization](docs/soroban-storage-optimization.md)
-
+- [Operator Cost Model](docs/cost-model.md) — XLM fees + MPC compute per hand
+- [Node Decommission & Secure Reshuffle](docs/node-decommission-reshuffle.md)
+- [Node Build-Provenance Attestation](docs/node-attestation.md)
+- [MPC Session Preemption Policy](docs/mpc-preemption-policy.md)

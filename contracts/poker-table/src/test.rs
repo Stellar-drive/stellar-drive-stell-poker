@@ -33,6 +33,20 @@ mod test {
         ) {
         }
 
+        /// End game.
+        ///
+        /// # Parameters
+        /// - `_session_id`: parameter
+        /// - `_player1_won`: parameter
+        ///
+        /// # Returns
+        /// - `()`
+        ///
+        /// # Errors
+        /// Returns an error if the operation fails.
+        ///
+        /// # Authorization
+        /// Requires appropriate authorization.
         pub fn end_game(_env: Env, _session_id: u32, _player1_won: bool) {}
     }
 
@@ -62,8 +76,8 @@ mod test {
             token: token.clone(),
             min_buy_in: 100,
             max_buy_in: 1000,
-            small_blind: 5,
-            big_blind: 10,
+            betting_structure: crate::types::BettingStructure::NoLimit,
+            blinds_schedule: BlindsSchedule::fixed(env, 5, 10),
             min_players: 2,
             max_players: 6,
             timeout_ledgers: 100,
@@ -75,6 +89,10 @@ mod test {
             jackpot_rake_share_bps: 0,
             min_bad_beat_category: 7,
             min_bad_beat_rank: 12,
+            street_time_limit: OptionalStreetTimeLimit::None,
+            treasury: None,
+            dead_chip_timeout_ledgers: 0,
+            reclaim_period_ledgers: 0,
         }
     }
 
@@ -134,8 +152,8 @@ mod test {
             token: token.clone(),
             min_buy_in: 100,
             max_buy_in: 100_000,
-            small_blind: 100,
-            big_blind: 200,
+            betting_structure: crate::types::BettingStructure::NoLimit,
+            blinds_schedule: BlindsSchedule::fixed(env, 100, 200),
             min_players: 2,
             max_players: 6,
             timeout_ledgers: 100,
@@ -147,6 +165,10 @@ mod test {
             jackpot_rake_share_bps: 0,
             min_bad_beat_category: 7,
             min_bad_beat_rank: 12,
+            street_time_limit: OptionalStreetTimeLimit::None,
+            treasury: None,
+            dead_chip_timeout_ledgers: 0,
+            reclaim_period_ledgers: 0,
         }
     }
 
@@ -196,8 +218,9 @@ mod test {
         assert_eq!(table.admin, s.admin);
         assert_eq!(table.config.min_buy_in, 100);
         assert_eq!(table.config.max_buy_in, 1000);
-        assert_eq!(table.config.small_blind, 5);
-        assert_eq!(table.config.big_blind, 10);
+        let level = table.config.blinds_schedule.levels.get(0).unwrap();
+        assert_eq!(level.small_blind, 5);
+        assert_eq!(level.big_blind, 10);
         assert_eq!(table.config.min_players, 2);
         assert_eq!(table.config.max_players, 6);
         assert_eq!(table.phase, GamePhase::Waiting);
@@ -214,6 +237,40 @@ mod test {
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_export_table_state_versioned_snapshot() {
+        use soroban_sdk::Vec as SdkVec;
+        let s = setup();
+        let table_id = create_default_table(&s);
+        let p1 = Address::generate(&s.env);
+        let p2 = Address::generate(&s.env);
+        join_player(&s, table_id, &p1, &500);
+        join_player(&s, table_id, &p2, &700);
+        s.client.start_hand(&table_id);
+
+        let export = s.client.export_table_state(&table_id);
+        // Stable versioned format.
+        assert_eq!(export.version, crate::types::TABLE_EXPORT_VERSION);
+        assert_eq!(export.version, 1);
+        assert_eq!(export.table_id, table_id);
+        // Seated stacks, seats, phase, button and config.
+        assert_eq!(export.phase, GamePhase::Dealing);
+        assert_eq!(export.dealer_seat, 1);
+        assert_eq!(export.hand_number, 1);
+        assert_eq!(export.seats.len(), 2);
+        assert_eq!(export.seats.get(0).unwrap().address, p1);
+        assert_eq!(export.seats.get(0).unwrap().seat_index, 0);
+        assert_eq!(export.seats.get(0).unwrap().stack, 495); // 500 - sb 5
+        assert_eq!(export.seats.get(1).unwrap().address, p2);
+        assert_eq!(export.seats.get(1).unwrap().stack, 690); // 700 - bb 10
+        assert_eq!(export.pot, 15);
+        assert_eq!(export.board_cards, SdkVec::new(&s.env));
+        assert_eq!(export.config.max_players, 6);
+        let level = export.config.blinds_schedule.levels.get(0).unwrap();
+        assert_eq!(level.small_blind, 5);
+        assert_eq!(level.big_blind, 10);
     }
 
     // ---------------------------------------------------------------------------
@@ -293,8 +350,10 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #3)")]
-    fn test_join_table_above_max_players_rejected() {
+    fn test_join_table_above_max_players_queues_instead_of_erroring() {
+        // Joining a full table no longer errors — the player is queued
+        // instead (see the waiting-list feature), with their buy-in
+        // escrowed immediately so they can be auto-seated later.
         let s = setup();
         let config = TableConfig {
             max_players: 2,
@@ -308,7 +367,13 @@ mod test {
         }
 
         let extra = Address::generate(&s.env);
-        join_player(&s, table_id, &extra, 500);
+        let position = join_player(&s, table_id, &extra, 500);
+        assert_eq!(position, 0); // first queue slot, not a seat index
+
+        assert_eq!(s.client.get_table(&table_id).players.len(), 2);
+        let queue = s.client.get_queue(&table_id);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.get(0).unwrap().player, extra);
     }
 
     // ---------------------------------------------------------------------------
@@ -451,7 +516,7 @@ mod test {
         let acting_player = table.players.get(current).unwrap();
 
         s.client
-            .player_action(&table_id, &acting_player.address, &Action::Fold);
+            .player_action(&table_id, &acting_player.address, &1u32, &Action::Fold);
 
         let table = s.client.get_table(&table_id);
         let folded_player = table.players.get(current).unwrap();
@@ -482,7 +547,7 @@ mod test {
         };
 
         s.client
-            .player_action(&table_id, &acting_player.address, &Action::Call);
+            .player_action(&table_id, &acting_player.address, &1u32, &Action::Call);
 
         let table_after = s.client.get_table(&table_id);
         let player_after = table_after.players.get(current).unwrap();
@@ -514,7 +579,7 @@ mod test {
 
         // SB calls the big blind. Once bets match, round ends automatically.
         s.client
-            .player_action(&table_id, &acting.address, &Action::Call);
+            .player_action(&table_id, &acting.address, &1u32, &Action::Call);
 
         // Round completes -> DealingFlop
         let table = s.client.get_table(&table_id);
@@ -545,7 +610,7 @@ mod test {
         let bet_amount: i128 = 20;
 
         s.client
-            .player_action(&table_id, &acting.address, &Action::Bet(bet_amount));
+            .player_action(&table_id, &acting.address, &1u32, &Action::Bet(bet_amount));
 
         let table = s.client.get_table(&table_id);
         let player_after = table.players.get(current).unwrap();
@@ -580,7 +645,7 @@ mod test {
 
         // Player folds
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
 
         // Table should be in Settlement with pot awarded to remaining player
         let table = s.client.get_table(&table_id);
@@ -609,7 +674,7 @@ mod test {
         assert_eq!(turn1, 1);
         let player1 = table.players.get(turn1).unwrap();
         s.client
-            .player_action(&table_id, &player1.address, &Action::Call);
+            .player_action(&table_id, &player1.address, &1u32, &Action::Call);
 
         // Seat 2 (SB, bet was 5) calls (adds 5 to match BB at 10)
         let table = s.client.get_table(&table_id);
@@ -617,7 +682,7 @@ mod test {
         assert_eq!(turn2, 2);
         let player2 = table.players.get(turn2).unwrap();
         s.client
-            .player_action(&table_id, &player2.address, &Action::Call);
+            .player_action(&table_id, &player2.address, &1u32, &Action::Call);
 
         // All bets now match at 10 -> round ends automatically -> DealingFlop
         let table = s.client.get_table(&table_id);
@@ -647,14 +712,14 @@ mod test {
 
         // Player raises by 20 on top of calling the big blind
         s.client
-            .player_action(&table_id, &raiser.address, &Action::Raise(20));
+            .player_action(&table_id, &raiser.address, &1u32, &Action::Raise(20));
 
         // Other player calls the raise
         let table = s.client.get_table(&table_id);
         let current = table.current_turn;
         let caller = table.players.get(current).unwrap();
         s.client
-            .player_action(&table_id, &caller.address, &Action::Call);
+            .player_action(&table_id, &caller.address, &1u32, &Action::Call);
 
         // Round should advance to DealingFlop
         let table = s.client.get_table(&table_id);
@@ -680,7 +745,7 @@ mod test {
 
         // Go all-in
         s.client
-            .player_action(&table_id, &player.address, &Action::AllIn);
+            .player_action(&table_id, &player.address, &1u32, &Action::AllIn);
 
         let table = s.client.get_table(&table_id);
         let p = table.players.get(current).unwrap();
@@ -735,7 +800,7 @@ mod test {
         let current = table.current_turn;
         let folder = table.players.get(current).unwrap();
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
 
         let table = s.client.get_table(&table_id);
         assert_eq!(table.phase, GamePhase::Settlement);
@@ -802,7 +867,7 @@ mod test {
         let c = table.current_turn;
         let actor = table.players.get(c).unwrap();
         s.client
-            .player_action(&table_id, &actor.address, &Action::Call);
+            .player_action(&table_id, &actor.address, &1u32, &Action::Call);
 
         let table = s.client.get_table(&table_id);
         assert_eq!(table.phase, GamePhase::DealingFlop);
@@ -887,7 +952,7 @@ mod test {
         let c = table.current_turn;
         let folder = table.players.get(c).unwrap();
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
 
         let table = s.client.get_table(&table_id);
         assert_eq!(table.phase, GamePhase::Settlement);
@@ -954,7 +1019,7 @@ mod test {
         let winner_stack_before = table.players.get(other_seat).unwrap().stack;
 
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
 
         let table = s.client.get_table(&table_id);
         // 5% of 300 = 15 rake; winner receives the remaining 285.
@@ -974,8 +1039,7 @@ mod test {
         // zero — the whole pot goes to the winner and no chips are burned.
         let s = setup();
         let config = TableConfig {
-            small_blind: 1,
-            big_blind: 2,
+            blinds_schedule: BlindsSchedule::fixed(&s.env, 1, 2),
             ..rake_config(&s.env, &s.token.address, &s.committee, &s.verifier, 100) // 1%
         };
         let table_id = s.client.create_table(&s.admin, &config);
@@ -997,7 +1061,7 @@ mod test {
         let winner_stack_before = table.players.get(other_seat).unwrap().stack;
 
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
 
         let table = s.client.get_table(&table_id);
         // floor(3 * 100 / 10_000) = 0 -> no rake taken, full pot to winner.
@@ -1024,7 +1088,7 @@ mod test {
         let current = table.current_turn;
         let folder = table.players.get(current).unwrap();
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
 
         let accrued = s.client.get_rake_balance(&table_id);
         assert_eq!(accrued, 15);
@@ -1124,7 +1188,7 @@ mod test {
         let current = table.current_turn;
         let actor = table.players.get(current).unwrap();
         s.client
-            .player_action(&table_id, &actor.address, &Action::Fold);
+            .player_action(&table_id, &actor.address, &1u32, &Action::Fold);
     }
 
     #[test]
@@ -1175,7 +1239,7 @@ mod test {
         let table = s.client.get_table(&table_id);
         let folder = table.players.get(table.current_turn).unwrap();
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
     }
 
     #[test]
@@ -1298,12 +1362,12 @@ mod test {
         let table = s.client.get_table(&table_id);
         let raiser = table.players.get(table.current_turn).unwrap();
         s.client
-            .player_action(&table_id, &raiser.address, &Action::Raise(200));
+            .player_action(&table_id, &raiser.address, &1u32, &Action::Raise(200));
 
         let table = s.client.get_table(&table_id);
         let folder = table.players.get(table.current_turn).unwrap();
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
 
         let record = s.client.get_hand(&table_id, &1).unwrap();
         assert_eq!(record.actions.len(), 2);
@@ -1439,7 +1503,7 @@ mod test {
         let table = s.client.get_table(&table_id);
         let folder = table.players.get(table.current_turn).unwrap();
         s.client
-            .player_action(&table_id, &folder.address, &Action::Fold);
+            .player_action(&table_id, &folder.address, &1u32, &Action::Fold);
 
         let table = s.client.get_table(&table_id);
         let short = table
@@ -1512,13 +1576,7 @@ mod test {
         play_fold_hand(&s, table_id);
         assert_eq!(s.client.get_table(&table_id).phase, GamePhase::Settlement);
 
-        let stack_before = s
-            .client
-            .get_table(&table_id)
-            .players
-            .get(0)
-            .unwrap()
-            .stack;
+        let stack_before = s.client.get_table(&table_id).players.get(0).unwrap().stack;
         let new_stack = rebuy(&s, table_id, &p1, 100);
         assert_eq!(new_stack, stack_before + 100);
     }

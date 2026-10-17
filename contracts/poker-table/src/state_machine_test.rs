@@ -48,6 +48,20 @@ impl GameHubContract {
     ) {
     }
 
+    /// End game.
+    ///
+    /// # Parameters
+    /// - `_session_id`: parameter
+    /// - `_player1_won`: parameter
+    ///
+    /// # Returns
+    /// - `()`
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Authorization
+    /// Requires appropriate authorization.
     pub fn end_game(_env: Env, _session_id: u32, _player1_won: bool) {}
 }
 
@@ -73,7 +87,9 @@ fn act(
     player: &Address,
     action: &Action,
 ) -> Result<(), PokerTableError> {
-    env.as_contract(poker, || betting::process_action(env, table, player, action))
+    env.as_contract(poker, || {
+        betting::process_action(env, table, player, action)
+    })
 }
 
 /// Maximum seated players per table (matches the contract cap).
@@ -184,8 +200,8 @@ fn build_preflop_state(
             token: admin.clone(),
             min_buy_in: 0,
             max_buy_in: i128::MAX,
-            small_blind,
-            big_blind,
+            betting_structure: crate::types::BettingStructure::NoLimit,
+            blinds_schedule: BlindsSchedule::fixed(env, small_blind, big_blind),
             min_players: 2,
             max_players: MAX_PLAYERS_PER_TABLE,
             timeout_ledgers: 0,
@@ -197,6 +213,10 @@ fn build_preflop_state(
             jackpot_rake_share_bps: 0,
             min_bad_beat_category: 7,
             min_bad_beat_rank: 12,
+            street_time_limit: OptionalStreetTimeLimit::None,
+            treasury: None,
+            dead_chip_timeout_ledgers: 0,
+            reclaim_period_ledgers: 0,
         },
         phase: GamePhase::Preflop,
         players,
@@ -215,9 +235,13 @@ fn build_preflop_state(
         rake_balance: 0,
         action_deadline: 0,
         hand_actions: Vec::new(env),
-        rit_state: None,
+        rit_state: OptionalRitState::None,
         jackpot_balance: 0,
         last_raise_size: big_blind,
+        current_blind_level: 0,
+        level_started_at: 0,
+        break_ends_at: 0,
+        settlement_entered_ledger: 0,
     };
 
     // Same blind placement and UTG calculation as the public contract:
@@ -288,10 +312,19 @@ fn phase_rank(phase: &GamePhase) -> u8 {
         GamePhase::River => 8,
         GamePhase::Showdown => 9,
         GamePhase::Settlement => 10,
+        // Run-It-Twice is an alternate path taken instead of the normal
+        // Showdown/Settlement sequence when two players go all-in heads-up.
+        // Both showdown runs occupy the same stage as the regular Showdown;
+        // the final pot split occupies the same stage as Settlement.
+        GamePhase::AwaitingRunItTwice => 9,
+        GamePhase::ShowdownRun1 => 9,
+        GamePhase::ShowdownRun2 => 9,
+        GamePhase::RitSettlement => 10,
         // `Dispute` is unreachable in the betting state machine and is
         // assigned the highest rank so any spurious transition fails the
         // monotonicity assertion loudly.
         GamePhase::Dispute => u8::MAX,
+        GamePhase::WaitingForPlayers => 0,
     }
 }
 
@@ -330,7 +363,9 @@ fn synthesize_legal_action(table: &TableState, intent: Intent) -> Action {
         .expect("current_turn in range");
     let bet = current_bet(table);
     let to_call = bet - curr.bet_this_round;
-    let bb = table.config.big_blind;
+    let bb = crate::game::current_blind_level(table)
+        .expect("valid blind level")
+        .big_blind;
     match intent {
         Intent::Fold => Action::Fold,
         Intent::AllIn => Action::AllIn,

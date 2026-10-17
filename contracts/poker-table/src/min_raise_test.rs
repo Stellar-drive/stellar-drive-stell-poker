@@ -31,6 +31,20 @@ impl MinRaiseHubStub {
         _p2_pts: i128,
     ) {
     }
+    /// End game.
+    ///
+    /// # Parameters
+    /// - `_session_id`: parameter
+    /// - `_p1_won`: parameter
+    ///
+    /// # Returns
+    /// - `()`
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    ///
+    /// # Authorization
+    /// Requires appropriate authorization.
     pub fn end_game(_env: Env, _session_id: u32, _p1_won: bool) {}
 }
 
@@ -84,8 +98,8 @@ fn two_player_table(
             token: admin.clone(),
             min_buy_in: 0,
             max_buy_in: i128::MAX,
-            small_blind,
-            big_blind,
+            betting_structure: crate::types::BettingStructure::NoLimit,
+            blinds_schedule: BlindsSchedule::fixed(env, small_blind, big_blind),
             min_players: 2,
             max_players: 6,
             timeout_ledgers: 0,
@@ -97,6 +111,10 @@ fn two_player_table(
             jackpot_rake_share_bps: 0,
             min_bad_beat_category: 7,
             min_bad_beat_rank: 12,
+            street_time_limit: OptionalStreetTimeLimit::None,
+            treasury: None,
+            dead_chip_timeout_ledgers: 0,
+            reclaim_period_ledgers: 0,
         },
         phase: GamePhase::Preflop,
         players,
@@ -117,6 +135,11 @@ fn two_player_table(
         hand_actions: Vec::new(env),
         jackpot_balance: 0,
         last_raise_size: big_blind,
+        rit_state: OptionalRitState::None,
+        current_blind_level: 0,
+        level_started_at: 0,
+        break_ends_at: 0,
+        settlement_entered_ledger: 0,
     };
 
     // Post SB/BB manually so both players have placed their blinds.
@@ -149,7 +172,9 @@ fn act(
     player: &Address,
     action: &Action,
 ) -> Result<(), PokerTableError> {
-    env.as_contract(poker, || betting::process_action(env, table, player, action))
+    env.as_contract(poker, || {
+        betting::process_action(env, table, player, action)
+    })
 }
 
 // ---------------------------------------------------------------------------

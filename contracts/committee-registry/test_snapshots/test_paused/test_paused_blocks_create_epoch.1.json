@@ -42,6 +42,9 @@
                 },
                 {
                   "i128": "100"
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -147,6 +150,18 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "DelegationCooldown"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 0
                       }
                     },
                     {

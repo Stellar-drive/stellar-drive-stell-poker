@@ -21,7 +21,7 @@
  *  "winner"   — ascending arpeggio + shimmering release (hand won)
  */
 
-export type SoundName = "shuffle" | "chip" | "flip" | "winner";
+export type SoundName = "shuffle" | "chip" | "flip" | "winner" | "deal" | "bet" | "fold" | "win";
 
 // ── Module-level singleton ───────────────────────────────────────────────────
 
@@ -68,6 +68,10 @@ async function ensureRunning(): Promise<AudioContext | null> {
 
 // ── State helpers ────────────────────────────────────────────────────────────
 
+/** Loads Sfx Muted.
+ * @returns boolean.
+ * @remarks Reads/writes browser storage.
+ */
 export function getSfxMuted(): boolean {
   if (typeof window === "undefined") return false;
   // Read from localStorage on first call so pref survives page reload
@@ -76,31 +80,49 @@ export function getSfxMuted(): boolean {
   return _muted;
 }
 
+/** Persists Sfx Muted.
+ * @param muted - muted.
+ * @remarks Reads/writes browser storage.
+ */
 export function setSfxMuted(muted: boolean): void {
   _muted = muted;
   if (typeof window !== "undefined") {
-    localStorage.setItem(SFX_MUTE_KEY, String(muted));
+    try { localStorage.setItem(SFX_MUTE_KEY, String(muted)); } catch {}
   }
   if (_masterGain) {
-    _masterGain.gain.setTargetAtTime(muted ? 0 : _volume, _masterGain.context.currentTime, 0.02);
+    try {
+      _masterGain.gain.setTargetAtTime(muted ? 0 : _volume, _masterGain.context.currentTime, 0.02);
+    } catch {}
   }
 }
 
+/** Loads Sfx Volume.
+ * @returns number.
+ * @remarks Reads/writes browser storage.
+ */
 export function getSfxVolume(): number {
   if (typeof window !== "undefined") {
-    const stored = localStorage.getItem(SFX_VOL_KEY);
-    if (stored !== null) _volume = Math.max(0, Math.min(1, parseFloat(stored)));
+    try {
+      const stored = localStorage.getItem(SFX_VOL_KEY);
+      if (stored !== null) _volume = Math.max(0, Math.min(1, parseFloat(stored)));
+    } catch {}
   }
   return _volume;
 }
 
+/** Persists Sfx Volume.
+ * @param v - v.
+ * @remarks Reads/writes browser storage.
+ */
 export function setSfxVolume(v: number): void {
   _volume = Math.max(0, Math.min(1, v));
   if (typeof window !== "undefined") {
-    localStorage.setItem(SFX_VOL_KEY, String(_volume));
+    try { localStorage.setItem(SFX_VOL_KEY, String(_volume)); } catch {}
   }
   if (_masterGain && !_muted) {
-    _masterGain.gain.setTargetAtTime(_volume, _masterGain.context.currentTime, 0.02);
+    try {
+      _masterGain.gain.setTargetAtTime(_volume, _masterGain.context.currentTime, 0.02);
+    } catch {}
   }
 }
 
@@ -273,6 +295,15 @@ function synthesiseWinner(ctx: AudioContext, out: GainNode) {
   playNoiseWhip(ctx, out, shimmerStart, 0.12, 0.12, 4000);
 }
 
+/**
+ * fold — soft downward swish for card folding.
+ */
+function synthesiseFold(ctx: AudioContext, out: GainNode) {
+  const t = ctx.currentTime;
+  playNoiseWhip(ctx, out, t, 0.08, 0.2, 1200);
+  playSineBlip(ctx, out, t, 350, 0.08, 0.08);
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 const SYNTHS: Record<SoundName, (ctx: AudioContext, out: GainNode) => void> = {
@@ -280,6 +311,10 @@ const SYNTHS: Record<SoundName, (ctx: AudioContext, out: GainNode) => void> = {
   chip: synthesiseChip,
   flip: synthesiseFlip,
   winner: synthesiseWinner,
+  deal: synthesiseShuffle,
+  bet: synthesiseChip,
+  fold: synthesiseFold,
+  win: synthesiseWinner,
 };
 
 /**

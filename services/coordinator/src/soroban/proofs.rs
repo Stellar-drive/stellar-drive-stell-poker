@@ -425,6 +425,8 @@ fn convert_keccak_proof_to_soroban(proof_bytes: &[u8]) -> Result<Vec<u8>, String
 fn field_to_bytes32_hex(field_str: &str) -> Result<String, String> {
     let fr = Fr::from_str(field_str.trim())
         .map_err(|_| format!("invalid field element: {field_str}"))?;
+    let fr = Fr::from_str(field_str)
+        .map_err(|_| format!("invalid field element: {}", field_str))?;
     let bytes = fr.into_bigint().to_bytes_be();
     // Pad to exactly 32 bytes (should already be, but be safe)
     if bytes.len() > 32 {
@@ -451,6 +453,7 @@ fn public_inputs_to_hex(public_inputs: &[String]) -> Result<String, String> {
     for pi in public_inputs {
         let fr = Fr::from_str(pi.trim())
             .map_err(|_| format!("invalid field element: {pi}"))?;
+        let fr = Fr::from_str(pi).map_err(|_| format!("invalid public input: {}", pi))?;
         let bytes = fr.into_bigint().to_bytes_be();
         let mut padded = vec![0u8; 32 - bytes.len()];
         padded.extend_from_slice(&bytes);
@@ -532,8 +535,7 @@ mod error_handling_tests {
 
     #[test]
     fn fields_json_rejects_invalid_entry() {
-        let err =
-            fields_to_bytes32_json(&["12".to_string(), "bad-field".to_string()]).unwrap_err();
+        let err = fields_to_bytes32_json(&["12".to_string(), "bad-field".to_string()]).unwrap_err();
         assert!(err.contains("failed to parse field element"), "got: {err}");
     }
 

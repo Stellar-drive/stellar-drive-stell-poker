@@ -1,5 +1,10 @@
 const API_BASE = process.env.NEXT_PUBLIC_COORDINATOR_URL || "http://localhost:8080";
 const INSECURE_AUTH_ENV = process.env.NEXT_PUBLIC_ALLOW_INSECURE_DEV_AUTH;
+/** COORDINATOR API BASE.
+ * @param value - value.
+ * @returns boolean | null.
+ * @remarks Calls the coordinator REST API.
+ */
 export const COORDINATOR_API_BASE = API_BASE;
 
 function parseEnvBool(value: string | undefined): boolean | null {
@@ -12,6 +17,7 @@ function parseEnvBool(value: string | undefined): boolean | null {
 
 const USE_INSECURE_DEV_AUTH = parseEnvBool(INSECURE_AUTH_ENV) ?? false;
 
+/** Deal Response shape. */
 export interface DealResponse {
   status: string;
   deck_root: string;
@@ -21,6 +27,7 @@ export interface DealResponse {
   tx_hash: string | null;
 }
 
+/** Reveal Response shape. */
 export interface RevealResponse {
   status: string;
   cards: number[];
@@ -29,6 +36,7 @@ export interface RevealResponse {
   tx_hash: string | null;
 }
 
+/** Showdown Response shape. */
 export interface ShowdownResponse {
   status: string;
   winner: string;
@@ -38,6 +46,7 @@ export interface ShowdownResponse {
   tx_hash: string | null;
 }
 
+/** Player Action Response shape. */
 export interface PlayerActionResponse {
   status: string;
   action: string;
@@ -46,10 +55,12 @@ export interface PlayerActionResponse {
   tx_hash: string | null;
 }
 
+/** Table State Response shape. */
 export interface TableStateResponse {
   state: string;
 }
 
+/** Parsed Table State Response shape. */
 export interface ParsedTableStateResponse {
   raw: string;
   parsed: Record<string, unknown> | null;
@@ -66,6 +77,29 @@ export interface GameStateEvent {
   reveal_tx_hashes: Record<string, string>;
   showdown_tx_hash: string | null;
   onchain_state: string | null;
+  /** Live anonymous spectators on this table (Issue #171). */
+  spectator_count?: number;
+}
+
+/** Pushed on a table's game-state channel whenever its spectator count changes (Issue #171). */
+export interface SpectatorCountEvent {
+  type: "spectators";
+  table_id: number;
+  spectator_count: number;
+}
+
+/** Game State Socket Message shape. */
+export type GameStateSocketMessage = GameStateEvent | SpectatorCountEvent;
+
+/** Checks is Spectator Count Event.
+ * @param msg - msg.
+ * @returns msg is SpectatorCountEvent.
+ * @remarks Calls the coordinator REST API.
+ */
+export function isSpectatorCountEvent(
+  msg: GameStateSocketMessage
+): msg is SpectatorCountEvent {
+  return (msg as SpectatorCountEvent).type === "spectators";
 }
 
 /** Derives the coordinator's ws(s):// origin from its http(s):// base URL. */
@@ -73,6 +107,7 @@ export function coordinatorWsBase(): string {
   return COORDINATOR_API_BASE.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
 }
 
+/** Game State Socket Handle shape. */
 export interface GameStateSocketHandle {
   stop: () => void;
 }
@@ -86,7 +121,8 @@ export interface GameStateSocketHandle {
  */
 export function subscribeGameState(
   tableId: number,
-  onUpdate: (event: GameStateEvent) => void
+  onUpdate: (event: GameStateSocketMessage) => void,
+  options: { spectate?: boolean } = {}
 ): GameStateSocketHandle | null {
   if (typeof WebSocket === "undefined") {
     return null;
@@ -98,12 +134,16 @@ export function subscribeGameState(
 
   const connect = () => {
     if (!active) return;
-    const wsUrl = `${coordinatorWsBase()}/api/table/${tableId}/state/ws`;
+    // Spectators connect to `/spectate/ws`, which carries the same public
+    // snapshots but counts the connection towards the table's spectator
+    // indicator (Issue #171). No wallet or auth is needed for either.
+    const path = options.spectate ? "spectate/ws" : "state/ws";
+    const wsUrl = `${coordinatorWsBase()}/api/table/${tableId}/${path}`;
     ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {
       try {
-        onUpdate(JSON.parse(event.data) as GameStateEvent);
+        onUpdate(JSON.parse(event.data) as GameStateSocketMessage);
       } catch {
         // Ignore malformed frames.
       }
@@ -131,6 +171,7 @@ export function subscribeGameState(
   };
 }
 
+/** Player Cards Response shape. */
 export interface PlayerCardsResponse {
   card1: number;
   card2: number;
@@ -138,24 +179,31 @@ export interface PlayerCardsResponse {
   salt2: string;
 }
 
+/** Committee Status Response shape. */
 export interface CommitteeStatusResponse {
   nodes: number;
   healthy: boolean[];
   status: string;
 }
 
+/** Chain Config Response shape. */
 export interface ChainConfigResponse {
   rpc_url: string;
   network_passphrase: string;
   poker_table_contract: string;
+  /** Player avatar registry contract address (Issue #153). Optional — older
+   *  network deploys may not have it; frontend falls back to Identicon. */
+  player_avatar_contract?: string;
 }
 
+/** Create Table Response shape. */
 export interface CreateTableResponse {
   table_id: number;
   max_players: number;
   joined_wallets: number;
 }
 
+/** Join Table Response shape. */
 export interface JoinTableResponse {
   table_id: number;
   seat_index: number;
@@ -164,14 +212,18 @@ export interface JoinTableResponse {
   max_players: number;
 }
 
+/** Open Table Info shape. */
 export interface OpenTableInfo {
   table_id: number;
   phase: string;
   max_players: number;
   joined_wallets: number;
   open_wallet_slots: number;
+  /** Live anonymous spectators (Issue #171). Absent on older coordinators. */
+  spectators?: number;
 }
 
+/** Open Tables Response shape. */
 export interface OpenTablesResponse {
   tables: OpenTableInfo[];
 }
@@ -184,8 +236,11 @@ export interface TableOverviewInfo {
   seated: number;
   total_chips: number;
   stacks: number[];
+  /** Live anonymous spectators (Issue #171). Absent on older coordinators. */
+  spectators?: number;
 }
 
+/** Table Overview Response shape. */
 export interface TableOverviewResponse {
   tables: TableOverviewInfo[];
 }
@@ -207,18 +262,21 @@ export interface RatingEntry {
   hands_won: number;
 }
 
+/** Rating Leaderboard Response shape. */
 export interface RatingLeaderboardResponse {
   entries: RatingEntry[];
   min_hands: number;
   total: number;
 }
 
+/** Lobby Seat shape. */
 export interface LobbySeat {
   seat_index: number;
   chain_address: string;
   wallet_address: string | null;
 }
 
+/** Table Lobby Response shape. */
 export interface TableLobbyResponse {
   table_id: number;
   phase: string;
@@ -227,6 +285,7 @@ export interface TableLobbyResponse {
   joined_wallets: number;
 }
 
+/** Auth Signer shape. */
 export interface AuthSigner {
   address: string;
   signMessage: (message: string) => Promise<string>;
@@ -328,6 +387,13 @@ async function authedFetch(
   return fetch(url, withMergedHeaders(init, signedHeaders));
 }
 
+/** Runs Deal.
+ * @param tableId - table Id.
+ * @param players - players.
+ * @param _auth - auth.
+ * @returns Promise<DealResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function requestDeal(
   tableId: number,
   players: string[] = [],
@@ -349,6 +415,14 @@ export async function requestDeal(
   return res.json();
 }
 
+/** Creates Table.
+ * @param auth - auth.
+ * @param maxPlayers - max Players.
+ * @param solo - solo.
+ * @param buyIn - buy In.
+ * @param token - token.
+ * @returns Promise<CreateTableResponse>.
+ */
 export async function createTable(
   auth: AuthSigner,
   maxPlayers: number,
@@ -391,6 +465,12 @@ export async function createTable(
   return res.json();
 }
 
+/** Runs Table.
+ * @param tableId - table Id.
+ * @param auth - auth.
+ * @returns Promise<JoinTableResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function joinTable(
   tableId: number,
   auth: AuthSigner
@@ -410,6 +490,10 @@ export async function joinTable(
   return res.json();
 }
 
+/** List Open Tables.
+ * @returns Promise<OpenTablesResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function listOpenTables(): Promise<OpenTablesResponse> {
   const res = await fetch(`${API_BASE}/api/tables/open`);
   if (!res.ok) {
@@ -456,6 +540,10 @@ export async function getRatingLeaderboard(
   return res.json();
 }
 
+/** Loads Chain Config.
+ * @returns Promise<ChainConfigResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function getChainConfig(): Promise<ChainConfigResponse> {
   const res = await fetch(`${API_BASE}/api/chain-config`);
   if (!res.ok) {
@@ -464,6 +552,11 @@ export async function getChainConfig(): Promise<ChainConfigResponse> {
   return res.json();
 }
 
+/** Loads Table Lobby.
+ * @param tableId - table Id.
+ * @returns Promise<TableLobbyResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function getTableLobby(
   tableId: number
 ): Promise<TableLobbyResponse> {
@@ -474,6 +567,13 @@ export async function getTableLobby(
   return res.json();
 }
 
+/** Runs Reveal.
+ * @param tableId - table Id.
+ * @param phase - phase.
+ * @param _auth - auth.
+ * @returns Promise<RevealResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function requestReveal(
   tableId: number,
   phase: "flop" | "turn" | "river",
@@ -491,6 +591,12 @@ export async function requestReveal(
   return res.json();
 }
 
+/** Runs Showdown.
+ * @param tableId - table Id.
+ * @param _auth - auth.
+ * @returns Promise<ShowdownResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function requestShowdown(
   tableId: number,
   _auth: AuthSigner
@@ -507,6 +613,13 @@ export async function requestShowdown(
   return res.json();
 }
 
+/** Runs Run It Twice.
+ * @param tableId - table Id.
+ * @param optIn - opt In.
+ * @param auth - auth.
+ * @returns Promise<.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function requestRunItTwice(
   tableId: number,
   optIn: boolean,
@@ -531,6 +644,14 @@ export async function requestRunItTwice(
   return res.json();
 }
 
+/** Runs player Action.
+ * @param tableId - table Id.
+ * @param action - action.
+ * @param amount - amount.
+ * @param auth - auth.
+ * @returns Promise<PlayerActionResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function playerAction(
   tableId: number,
   action: "fold" | "check" | "call" | "bet" | "raise" | "allin",
@@ -556,6 +677,13 @@ export async function playerAction(
   return res.json();
 }
 
+/** Loads Player Cards.
+ * @param tableId - table Id.
+ * @param address - address.
+ * @param auth - auth.
+ * @returns Promise<PlayerCardsResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function getPlayerCards(
   tableId: number,
   address: string,
@@ -574,6 +702,11 @@ export async function getPlayerCards(
   return res.json();
 }
 
+/** Loads Table State.
+ * @param tableId - table Id.
+ * @returns Promise<TableStateResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function getTableState(
   tableId: number
 ): Promise<TableStateResponse> {
@@ -584,6 +717,27 @@ export async function getTableState(
   return res.json();
 }
 
+/** Spectator Count Response shape. */
+export interface SpectatorCountResponse {
+  table_id: number;
+  spectator_count: number;
+}
+
+/** Public, unauthenticated spectator count for a table (Issue #171). */
+export async function getSpectatorCount(
+  tableId: number
+): Promise<SpectatorCountResponse> {
+  const res = await fetch(`${API_BASE}/api/table/${tableId}/spectators`);
+  if (!res.ok) {
+    throw new Error(await readApiError(res, `Failed to get spectators: ${res.status}`));
+  }
+  return res.json();
+}
+
+/** Loads Parsed Table State.
+ * @param tableId - table Id.
+ * @returns Promise<ParsedTableStateResponse>.
+ */
 export async function getParsedTableState(
   tableId: number
 ): Promise<ParsedTableStateResponse> {
@@ -598,6 +752,10 @@ export async function getParsedTableState(
   }
 }
 
+/** Loads Committee Status.
+ * @returns Promise<CommitteeStatusResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function getCommitteeStatus(): Promise<CommitteeStatusResponse> {
   const res = await fetch(`${API_BASE}/api/committee/status`);
   if (!res.ok) throw new Error(`Failed to get status: ${res.status}`);
@@ -606,12 +764,14 @@ export async function getCommitteeStatus(): Promise<CommitteeStatusResponse> {
 
 // ── Stats ────────────────────────────────────────────────────────────────────
 
+/** Global Stats shape. */
 export interface GlobalStats {
   hands_played: number;
   biggest_pot: number;
   total_players_joined: number;
 }
 
+/** Player Stats shape. */
 export interface PlayerStats {
   address: string;
   hands_played: number;
@@ -619,12 +779,17 @@ export interface PlayerStats {
   biggest_pot_won: number;
 }
 
+/** Stats Response shape. */
 export interface StatsResponse {
   global: GlobalStats;
   leaderboard: PlayerStats[];
   cached_at: number;
 }
 
+/** Loads Stats.
+ * @returns Promise<StatsResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function getStats(): Promise<StatsResponse> {
   const res = await fetch(`${API_BASE}/api/stats`);
   if (!res.ok) throw new Error(`Failed to get stats: ${res.status}`);
@@ -633,6 +798,7 @@ export async function getStats(): Promise<StatsResponse> {
 
 // ── MPC Node Status ──────────────────────────────────────────────────────────
 
+/** Mpc Node Progress shape. */
 export interface MpcNodeProgress {
   endpoint: string;
   phase: string;
@@ -640,6 +806,7 @@ export interface MpcNodeProgress {
   elapsed_secs: number;
 }
 
+/** Table Mpc Status Response shape. */
 export interface TableMpcStatusResponse {
   table_id: number;
   phase: string;
@@ -647,6 +814,11 @@ export interface TableMpcStatusResponse {
   active_sessions: number;
 }
 
+/** Loads Mpc Status.
+ * @param tableId - table Id.
+ * @returns Promise<TableMpcStatusResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function getMpcStatus(
   tableId: number
 ): Promise<TableMpcStatusResponse> {
@@ -657,14 +829,21 @@ export async function getMpcStatus(
   return res.json();
 }
 
+/** Wallet Challenge Response shape. */
 export interface WalletChallengeResponse {
   challenge: string;
 }
 
+/** Wallet Verify Response shape. */
 export interface WalletVerifyResponse {
   verified: boolean;
 }
 
+/** Loads Wallet Challenge.
+ * @param address - address.
+ * @returns Promise<WalletChallengeResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function getWalletChallenge(address: string): Promise<WalletChallengeResponse> {
   const res = await fetch(`${API_BASE}/api/wallet/challenge`, {
     method: "POST",
@@ -679,6 +858,13 @@ export async function getWalletChallenge(address: string): Promise<WalletChallen
   return res.json();
 }
 
+/** Verify Wallet Challenge.
+ * @param address - address.
+ * @param challenge - challenge.
+ * @param signature - signature.
+ * @returns Promise<WalletVerifyResponse>.
+ * @remarks Calls the coordinator REST API.
+ */
 export async function verifyWalletChallenge(
   address: string,
   challenge: string,

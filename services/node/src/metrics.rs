@@ -8,7 +8,7 @@
 //! `proof_generation` errors).
 
 use axum::{body::Body, http::Response};
-use prometheus::{Encoder, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, Gauge, GaugeVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
 
 #[derive(Clone)]
 pub struct NodeMetrics {
@@ -20,6 +20,20 @@ pub struct NodeMetrics {
     /// Session errors, labeled by the phase in which they occurred
     /// (e.g. "merge_shares", "witness_generation", "proof_generation").
     pub session_errors: IntCounterVec,
+    /// Node health status: 1 = healthy, 0 = unhealthy.
+    pub node_up: Gauge,
+    /// Process resident memory in bytes.
+    pub memory_bytes: Gauge,
+    /// Memory limit in bytes (from cgroups or env).
+    pub memory_limit_bytes: Gauge,
+    /// Clock skew in seconds (node time vs coordinator time).
+    pub clock_skew_seconds: Gauge,
+    /// Days until TLS certificate expires.
+    pub cert_expiry_days: GaugeVec,
+    /// Node-side proof cache hits, labeled by circuit name (#579).
+    pub proof_cache_hits: IntCounterVec,
+    /// Node-side proof cache misses, labeled by circuit name (#579).
+    pub proof_cache_misses: IntCounterVec,
 }
 
 impl NodeMetrics {
@@ -50,6 +64,39 @@ impl NodeMetrics {
         )
         .unwrap();
 
+        let node_up = Gauge::with_opts(Opts::new(
+            "mpc_node_up",
+            "Node health status: 1 = healthy, 0 = unhealthy.",
+        ))
+        .unwrap();
+
+        let memory_bytes = Gauge::with_opts(Opts::new(
+            "mpc_node_memory_bytes",
+            "Process resident memory in bytes.",
+        ))
+        .unwrap();
+
+        let memory_limit_bytes = Gauge::with_opts(Opts::new(
+            "mpc_node_memory_limit_bytes",
+            "Memory limit in bytes (from cgroups or env).",
+        ))
+        .unwrap();
+
+        let clock_skew_seconds = Gauge::with_opts(Opts::new(
+            "mpc_node_clock_skew_seconds",
+            "Clock skew in seconds (node time vs coordinator time).",
+        ))
+        .unwrap();
+
+        let cert_expiry_days = GaugeVec::new(
+            Opts::new(
+                "mpc_node_cert_expiry_days",
+                "Days until TLS certificate expires.",
+            ),
+            &["cert_type"],
+        )
+        .unwrap();
+
         registry
             .register(Box::new(active_sessions.clone()))
             .unwrap();
@@ -57,12 +104,55 @@ impl NodeMetrics {
             .register(Box::new(proofs_generated.clone()))
             .unwrap();
         registry.register(Box::new(session_errors.clone())).unwrap();
+        registry.register(Box::new(node_up.clone())).unwrap();
+        registry.register(Box::new(memory_bytes.clone())).unwrap();
+        registry
+            .register(Box::new(memory_limit_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(clock_skew_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(cert_expiry_days.clone()))
+            .unwrap();
+
+        let proof_cache_hits = IntCounterVec::new(
+            Opts::new(
+                "mpc_node_proof_cache_hits_total",
+                "Node-side proof cache hits, labeled by circuit.",
+            ),
+            &["circuit"],
+        )
+        .unwrap();
+
+        let proof_cache_misses = IntCounterVec::new(
+            Opts::new(
+                "mpc_node_proof_cache_misses_total",
+                "Node-side proof cache misses, labeled by circuit.",
+            ),
+            &["circuit"],
+        )
+        .unwrap();
+
+        registry
+            .register(Box::new(proof_cache_hits.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(proof_cache_misses.clone()))
+            .unwrap();
 
         Self {
             registry,
             active_sessions,
             proofs_generated,
             session_errors,
+            node_up,
+            memory_bytes,
+            memory_limit_bytes,
+            clock_skew_seconds,
+            cert_expiry_days,
+            proof_cache_hits,
+            proof_cache_misses,
         }
     }
 
@@ -150,6 +240,37 @@ mod tests {
                 .with_label_values(&["proof_generation"])
                 .get(),
             0
+        );
+    }
+
+    #[test]
+    fn proof_cache_hits_and_misses_counted_by_circuit() {
+        let metrics = NodeMetrics::new();
+        metrics
+            .proof_cache_hits
+            .with_label_values(&["deal_valid"])
+            .inc();
+        metrics
+            .proof_cache_misses
+            .with_label_values(&["deal_valid"])
+            .inc();
+        metrics
+            .proof_cache_misses
+            .with_label_values(&["deal_valid"])
+            .inc();
+        assert_eq!(
+            metrics
+                .proof_cache_hits
+                .with_label_values(&["deal_valid"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .proof_cache_misses
+                .with_label_values(&["deal_valid"])
+                .get(),
+            2
         );
     }
 

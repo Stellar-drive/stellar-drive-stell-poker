@@ -1,6 +1,8 @@
 use soroban_sdk::{Env, Symbol, Vec};
 
 use crate::constant_time;
+use crate::metrics;
+use crate::ttl;
 use crate::types::*;
 
 /// Completed hands retained per table. The buffer is circular — once it is
@@ -12,11 +14,6 @@ pub const HAND_HISTORY_CAPACITY: u32 = 16;
 /// longer than this is truncated: the record stays a *summary*, so the write
 /// cost of settling a hand never grows without bound.
 pub const MAX_ACTIONS_PER_HAND: u32 = 64;
-
-/// TTL for archived hand records — matched to the table's own TTL so history
-/// stays readable for as long as the table itself does.
-const HISTORY_TTL_THRESHOLD: u32 = 17_280; // ~1 day
-const HISTORY_TTL_EXTEND: u32 = 518_400; // ~30 days
 
 /// Append a betting action to the current hand's summary. Silently stops
 /// recording past `MAX_ACTIONS_PER_HAND` so a pathologically long hand cannot
@@ -69,18 +66,17 @@ pub fn archive_hand(
         players.push_back(p.address);
     }
 
+    // Resolve payout seats from the addresses collected above rather than
+    // reading each player record a second time.
     let mut resolved: Vec<Payout> = Vec::new(env);
     for i in 0..payouts.len() {
-        let (seat, amount) = payouts
-            .get(i)
-            .ok_or(PokerTableError::InvalidPlayerIndex)?;
-        let player = table
-            .players
+        let (seat, amount) = payouts.get(i).ok_or(PokerTableError::InvalidPlayerIndex)?;
+        let address = players
             .get(seat)
             .ok_or(PokerTableError::InvalidPlayerIndex)?;
         resolved.push_back(Payout {
             seat,
-            address: player.address,
+            address,
             amount,
         });
     }
@@ -101,9 +97,7 @@ pub fn archive_hand(
     let slot = meta.next_slot;
     let key = DataKey::HandRecord(table.id, slot);
     env.storage().persistent().set(&key, &record);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, HISTORY_TTL_THRESHOLD, HISTORY_TTL_EXTEND);
+    ttl::bump_persistent(env, &key, ttl::HISTORY);
 
     meta.next_slot = (slot + 1) % HAND_HISTORY_CAPACITY;
     if meta.stored < HAND_HISTORY_CAPACITY {
@@ -111,6 +105,7 @@ pub fn archive_hand(
     }
     meta.total_archived = meta.total_archived.saturating_add(1);
     save_meta(env, table.id, &meta);
+    metrics::record_hand_settled(env, table.id, rake);
 
     env.events().publish(
         (Symbol::new(env, "hand_archived"), table.id),
@@ -144,6 +139,39 @@ pub fn get_history(env: &Env, table_id: u32, limit: u32) -> Vec<HandRecord> {
     out
 }
 
+/// Read a chunk of archived hands with offset-based pagination (newest first).
+///
+/// * `offset` — how many records to skip from the newest (0 = start at newest).
+/// * `limit` — max records to return (capped at HAND_HISTORY_CAPACITY).
+///
+/// Each record read has its TTL extended (bump/footprint pattern).
+pub fn get_history_chunk(env: &Env, table_id: u32, offset: u32, limit: u32) -> Vec<HandRecord> {
+    let meta = load_meta(env, table_id);
+    let mut out: Vec<HandRecord> = Vec::new(env);
+    if meta.stored == 0 || offset >= meta.stored {
+        return out;
+    }
+    let take = core::cmp::min(limit, meta.stored.saturating_sub(offset));
+    if take == 0 {
+        return out;
+    }
+
+    // Walk backwards from the most recently written slot, skipping `offset`
+    // records, then taking `take` records.
+    let newest_slot = (meta.next_slot + HAND_HISTORY_CAPACITY - 1) % HAND_HISTORY_CAPACITY;
+    let start_slot = (newest_slot + HAND_HISTORY_CAPACITY - offset) % HAND_HISTORY_CAPACITY;
+
+    let mut slot = start_slot;
+    for _ in 0..take {
+        if let Some(record) = load_record(env, table_id, slot) {
+            out.push_back(record);
+        }
+        // Wrap backwards; underflow is prevented by the circular buffer math.
+        slot = (slot + HAND_HISTORY_CAPACITY - 1) % HAND_HISTORY_CAPACITY;
+    }
+    out
+}
+
 /// Look up a single archived hand by its hand number, if still in the window.
 pub fn get_hand(env: &Env, table_id: u32, hand_number: u32) -> Option<HandRecord> {
     let meta = load_meta(env, table_id);
@@ -157,6 +185,19 @@ pub fn get_hand(env: &Env, table_id: u32, hand_number: u32) -> Option<HandRecord
     None
 }
 
+/// Load meta.
+///
+/// # Parameters
+/// - `table_id`: parameter
+///
+/// # Returns
+/// - `HandHistoryMeta`
+///
+/// # Errors
+/// Returns an error if the operation fails.
+///
+/// # Authorization
+/// Requires appropriate authorization.
 pub fn load_meta(env: &Env, table_id: u32) -> HandHistoryMeta {
     env.storage()
         .persistent()
@@ -171,18 +212,14 @@ pub fn load_meta(env: &Env, table_id: u32) -> HandHistoryMeta {
 fn save_meta(env: &Env, table_id: u32, meta: &HandHistoryMeta) {
     let key = DataKey::HandHistoryMeta(table_id);
     env.storage().persistent().set(&key, meta);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, HISTORY_TTL_THRESHOLD, HISTORY_TTL_EXTEND);
+    ttl::bump_persistent(env, &key, ttl::HISTORY);
 }
 
 fn load_record(env: &Env, table_id: u32, slot: u32) -> Option<HandRecord> {
     let key = DataKey::HandRecord(table_id, slot);
     let record: Option<HandRecord> = env.storage().persistent().get(&key);
     if record.is_some() {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, HISTORY_TTL_THRESHOLD, HISTORY_TTL_EXTEND);
+        ttl::bump_persistent(env, &key, ttl::HISTORY);
     }
     record
 }

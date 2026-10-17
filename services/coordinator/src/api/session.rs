@@ -1,14 +1,18 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use uuid;
 
-use crate::{soroban, AppState, TableSession};
 use super::auth::is_valid_stellar_address;
 use super::parsing::{map_onchain_phase_to_local, normalize_field_value, parse_u32_value};
 use super::{MAX_PLAYERS, MIN_PLAYERS};
+use crate::{soroban, AppState, TableSession};
 
-pub(crate) async fn ensure_session_exists(state: &AppState, table_id: u32) -> Result<(), StatusCode> {
+pub(crate) async fn ensure_session_exists(
+    state: &AppState,
+    table_id: u32,
+) -> Result<(), StatusCode> {
     {
         let tables = state.tables.read().await;
         if tables.contains_key(&table_id) {
@@ -92,10 +96,7 @@ pub(crate) async fn fetch_onchain_table_view(
                 .get("seat_index")
                 .and_then(parse_u32_value)
                 .unwrap_or(0);
-            let stack = player
-                .get("stack")
-                .and_then(parse_i64_value)
-                .unwrap_or(0);
+            let stack = player.get("stack").and_then(parse_i64_value).unwrap_or(0);
             Some((seat, address, stack))
         })
         .collect();
@@ -298,6 +299,9 @@ fn build_session_from_onchain_state(
         rit_shared_board_count: 0,
         mpc_node_progress: Vec::new(),
         mpc_operation_started: None,
+        // Rehydrated sessions have no pinned hashes — they will be re-pinned
+        // on the next deal. No proof generation happens until a new deal starts.
+        pinned_artifact_hashes: HashMap::new(),
     })
 }
 
@@ -358,18 +362,20 @@ pub(crate) fn dynamic_discovery_active(state: &AppState) -> bool {
 /// Select 3 healthy MPC nodes, prioritizing those in the requested region.
 pub(crate) async fn select_mpc_nodes(
     state: &AppState,
+    table_id: u32,
     requested_region: Option<String>,
 ) -> Result<Vec<String>, StatusCode> {
     // Dynamic discovery: choose from nodes that self-registered at runtime and
     // are still heartbeating. The registry enforces the 3-healthy-node minimum
     // (returning None -> 503) just like the registry/static paths below.
     if dynamic_discovery_active(state) {
-        return state
+        let endpoints = state
             .node_registry
             .read()
             .await
             .select_session_nodes()
-            .ok_or(StatusCode::SERVICE_UNAVAILABLE);
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        return Ok(order_for_table(endpoints, table_id, state.mpc_config.table_affinity_enabled));
     }
 
     let all_nodes = if state.soroban_config.committee_registry_contract.is_empty() {
@@ -421,12 +427,33 @@ pub(crate) async fn select_mpc_nodes(
         healthy_members.sort_by_key(|m| m.region != *region);
     }
 
+    if state.mpc_config.table_affinity_enabled {
+        healthy_members.sort_by_key(|member| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            table_id.hash(&mut hasher);
+            member.endpoint.hash(&mut hasher);
+            hasher.finish()
+        });
+    }
+
     let selected = healthy_members
         .into_iter()
         .take(3)
         .map(|m| m.endpoint)
         .collect();
     Ok(selected)
+}
+
+fn order_for_table(mut endpoints: Vec<String>, table_id: u32, enabled: bool) -> Vec<String> {
+    if enabled {
+        endpoints.sort_by_key(|endpoint| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            table_id.hash(&mut hasher);
+            endpoint.hash(&mut hasher);
+            hasher.finish()
+        });
+    }
+    endpoints
 }
 
 pub(crate) fn is_identity_missing_error(error: &str) -> bool {

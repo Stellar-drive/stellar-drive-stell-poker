@@ -4,6 +4,9 @@ import { useEffect, useState } from "react";
 
 const THEME_KEY = "stellar-drive-stell-poker-ui-theme";
 
+/** Renders Theme Toggle.
+ * @remarks Reads/writes browser storage.
+ */
 export function ThemeToggle() {
   const [theme, setTheme] = useState<string>(() => {
     if (typeof window === "undefined") return "system";
