@@ -44,6 +44,7 @@ mod limits;
 mod metrics;
 mod pool;
 mod private_table;
+mod proof_cache;
 mod redact;
 mod profiling;
 mod session;

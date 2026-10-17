@@ -90,6 +90,7 @@ mod stats;
 mod telemetry;
 mod tls_client;
 mod tournament;
+mod transcript_log;
 
 use api::admin::{AdminConfig, AdminState};
 use api::MpcNodeProgress;
