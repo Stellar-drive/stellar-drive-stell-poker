@@ -70,6 +70,8 @@ mod mpc_node_benchmark;
 mod mpc_partition;
 mod mpc_validation;
 mod mpc_version;
+mod node_attestation;
+mod node_decommission;
 mod node_reliability;
 mod plugin;
 mod proof_cache;
@@ -82,6 +84,7 @@ mod session_cache;
 mod session_gc;
 mod session_isolation;
 mod session_migration;
+mod session_preemption;
 mod session_recovery;
 mod soroban;
 mod spectators;
@@ -445,6 +448,14 @@ struct AppState {
     /// Validated CSP violation reports for frontend `report-uri` /
     /// `report-to` ingestion (Issue #136).
     csp_reports: api::csp::CspReportStore,
+    /// Signed build attestations per MPC node (Issue #587).
+    attestation_store: node_attestation::AttestationStore,
+    /// Attestation policy: strict mode + accepted binary hashes (Issue #587).
+    attestation_config: node_attestation::AttestationConfig,
+    /// Committee node decommission / reshuffle state machine (Issue #585).
+    decommission: Arc<RwLock<node_decommission::DecommissionManager>>,
+    /// MPC session preemption policy controller (Issue #588).
+    preemption: Arc<RwLock<session_preemption::PreemptionController>>,
 }
 
 #[derive(Clone)]
@@ -846,6 +857,14 @@ async fn main() {
         archive_store: archive_store.clone(),
         archive_config: archive_config.clone(),
         csp_reports: api::csp::CspReportStore::new(),
+        attestation_store: node_attestation::new_store(),
+        attestation_config: node_attestation::AttestationConfig::from_env(),
+        decommission: Arc::new(RwLock::new(
+            node_decommission::DecommissionManager::from_env(),
+        )),
+        preemption: Arc::new(RwLock::new(
+            session_preemption::PreemptionController::from_env(),
+        )),
     };
     idempotency::spawn_gc_task(state.idempotency_store.clone());
     rate_limit::spawn_rate_alert_task(state.rejection_counter.clone());
@@ -976,31 +995,83 @@ async fn main() {
     let soroban_config = state.soroban_config.clone();
     let default_endpoints = state.mpc_config.node_endpoints.clone();
     let hc_client = state.mpc_client.clone();
+    // Issue #587: attestation gates health in strict mode.
+    let attestation_store = state.attestation_store.clone();
+    let attestation_config = state.attestation_config.clone();
+    let committee_registry_hc = state.committee_registry.clone();
     tokio::spawn(async move {
         loop {
-            let endpoints = if soroban_config.committee_registry_contract.is_empty() {
-                default_endpoints.clone()
+            // Each entry is (node_id, endpoint). Node ids let the strict
+            // attestation check identify who is claiming to be healthy.
+            let nodes: Vec<(String, String)> = if soroban_config
+                .committee_registry_contract
+                .is_empty()
+            {
+                default_endpoints
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ep)| (i.to_string(), ep.clone()))
+                    .collect()
             } else {
                 match soroban::fetch_active_nodes_from_registry(&soroban_config).await {
-                    Ok(members) => members.into_iter().map(|m| m.endpoint).collect(),
+                    Ok(members) => {
+                        let registry = committee_registry_hc.read().await;
+                        members
+                            .into_iter()
+                            .map(|m| {
+                                let node_id = registry
+                                    .iter()
+                                    .find(|(_, addr)| **addr == m.address)
+                                    .map(|(id, _)| id.clone())
+                                    .unwrap_or_default();
+                                (node_id, m.endpoint)
+                            })
+                            .collect()
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "Failed to fetch nodes from registry for health check: {}",
                             e
                         );
-                        default_endpoints.clone()
+                        default_endpoints
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ep)| (i.to_string(), ep.clone()))
+                            .collect()
                     }
                 }
             };
 
-            for endpoint in endpoints {
+            let now = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            for (node_id, endpoint) in nodes {
                 let url = format!("{}/health", endpoint);
-                let is_healthy = hc_client
+                let reachable = hc_client
                     .get(&url)
                     .send()
                     .await
                     .map(|r| r.status().is_success())
                     .unwrap_or(false);
+
+                // Strict mode refuses to treat an unattested peer as healthy.
+                let attested = node_attestation::is_attested(
+                    &attestation_store,
+                    &attestation_config,
+                    &node_id,
+                    now,
+                )
+                .await;
+                let is_healthy = reachable && attested;
+                if reachable && !attested {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        endpoint = %endpoint,
+                        "MPC node is reachable but unattested; refusing in strict mode"
+                    );
+                }
 
                 let mut guard = node_healths.lock().await;
                 if let Some(node) = guard.iter_mut().find(|n| n.endpoint == endpoint) {
@@ -1059,6 +1130,17 @@ async fn main() {
         .route("/api/mpc/identity/register", post(register_node_identity))
         .route("/api/mpc/identity/nodes", get(list_node_identities))
         .route("/api/mpc/identity/verify", post(verify_node_identity))
+        // Node build-provenance attestation (Issue #587)
+        .route("/api/mpc/attestation", post(submit_node_attestation))
+        .route("/api/mpc/attestation/status", get(get_attestation_status))
+        // Committee node decommission / secure reshuffle (Issue #585)
+        .route("/api/mpc/decommission/status", get(get_decommission_status))
+        .route("/api/mpc/decommission/begin", post(begin_node_decommission))
+        .route("/api/mpc/decommission/plan", post(plan_node_reshuffle))
+        .route("/api/mpc/decommission/enact", post(enact_node_reshuffle))
+        .route("/api/mpc/decommission/cancel", post(cancel_node_decommission))
+        // MPC session preemption policy (Issue #588)
+        .route("/api/mpc/preemption/status", get(get_preemption_status))
         // CSP violation report ingestion (Issue #136)
         .route("/api/csp/report", post(api::csp::report_csp))
         .route("/api/csp/reports", get(api::csp::list_csp_reports))
@@ -1938,6 +2020,168 @@ async fn verify_node_identity(
     .await
     .map(|_| axum::http::StatusCode::NO_CONTENT)
     .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e))
+}
+
+// -- Node build-provenance attestation (Issue #587) ----------------------
+
+/// POST /api/mpc/attestation
+///
+/// An MPC node reports a signed statement of the binary it is running. The
+/// signature is verified against the committee registry; an optional hash
+/// allow-list and freshness window are also enforced.
+async fn submit_node_attestation(
+    State(state): State<AppState>,
+    Json(att): Json<node_attestation::BuildAttestation>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    node_attestation::submit_attestation(
+        &state.attestation_store,
+        &state.attestation_config,
+        &state.committee_registry,
+        att,
+    )
+    .await
+    .map(|_| axum::http::StatusCode::NO_CONTENT)
+    .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))
+}
+
+/// GET /api/mpc/attestation/status
+///
+/// Every recorded attestation plus the current policy (strict mode, number of
+/// accepted hashes).
+async fn get_attestation_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stored = node_attestation::list_attestations(&state.attestation_store).await;
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let max_age = state.attestation_config.max_age_seconds;
+    let nodes: Vec<serde_json::Value> = stored
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "node_id": s.attestation.node_id,
+                "binary_sha256": s.attestation.binary_sha256,
+                "package_version": s.attestation.package_version,
+                "git_commit": s.attestation.git_commit,
+                "slsa_level": s.attestation.slsa_level,
+                "signer": s.attestation.signer,
+                "received_at": s.received_at,
+                "fresh": max_age <= 0 || now - s.received_at <= max_age,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "strict": state.attestation_config.strict,
+        "accepted_hashes": state.attestation_config.accepted_binary_hashes.len(),
+        "attested_nodes": nodes,
+    }))
+}
+
+// -- Committee node decommission / secure reshuffle (Issue #585) ---------
+
+#[derive(Deserialize)]
+struct BeginDecommissionRequest {
+    node_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReshuffleRequest {
+    node_id: String,
+    replacement_node: String,
+    #[serde(default)]
+    identity_preserved: bool,
+}
+
+#[derive(Deserialize)]
+struct NodeIdRequest {
+    node_id: String,
+}
+
+/// GET /api/mpc/decommission/status
+async fn get_decommission_status(
+    State(state): State<AppState>,
+) -> Json<Vec<node_decommission::NodeDecommissionStatus>> {
+    Json(state.decommission.read().await.status())
+}
+
+/// POST /api/mpc/decommission/begin
+///
+/// Start draining a node: no new sessions are assigned to it.
+async fn begin_node_decommission(
+    State(state): State<AppState>,
+    Json(req): Json<BeginDecommissionRequest>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    state
+        .decommission
+        .write()
+        .await
+        .begin(req.node_id, Instant::now())
+        .map(|_| axum::http::StatusCode::NO_CONTENT)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))
+}
+
+/// POST /api/mpc/decommission/plan
+///
+/// Plan a reshuffle of a drained node onto a replacement. `identity_preserved`
+/// must be set only when the replacement holds the same REP3 party identity.
+async fn plan_node_reshuffle(
+    State(state): State<AppState>,
+    Json(req): Json<ReshuffleRequest>,
+) -> Result<Json<node_decommission::ReshufflePlan>, (axum::http::StatusCode, String)> {
+    state
+        .decommission
+        .write()
+        .await
+        .plan_reshuffle(
+            &req.node_id,
+            req.replacement_node,
+            req.identity_preserved,
+            Instant::now(),
+        )
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))
+}
+
+/// POST /api/mpc/decommission/enact
+///
+/// Finalize a planned reshuffle and mark the node decommissioned.
+async fn enact_node_reshuffle(
+    State(state): State<AppState>,
+    Json(req): Json<NodeIdRequest>,
+) -> Result<Json<node_decommission::ReshufflePlan>, (axum::http::StatusCode, String)> {
+    state
+        .decommission
+        .write()
+        .await
+        .enact_reshuffle(&req.node_id)
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))
+}
+
+/// POST /api/mpc/decommission/cancel
+///
+/// Cancel a decommission (e.g. the node was repaired) and allow it to accept
+/// sessions again.
+async fn cancel_node_decommission(
+    State(state): State<AppState>,
+    Json(req): Json<NodeIdRequest>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    state
+        .decommission
+        .write()
+        .await
+        .cancel(&req.node_id)
+        .map(|_| axum::http::StatusCode::NO_CONTENT)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))
+}
+
+// -- MPC session preemption policy (Issue #588) --------------------------
+
+/// GET /api/mpc/preemption/status
+async fn get_preemption_status(
+    State(state): State<AppState>,
+) -> Json<session_preemption::PreemptionStatus> {
+    Json(state.preemption.read().await.status())
 }
 
 /// GET /api/leader

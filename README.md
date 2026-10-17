@@ -413,3 +413,7 @@ export function CreateTableButton() {
 - [Noir Testing Guide](docs/NOIR_TESTING_GUIDE.md)
 - [Local Committee Development Guide](docs/local-committee-dev-guide.md)
 - [Soroban Storage Optimization](docs/soroban-storage-optimization.md)
+- [Operator Cost Model](docs/cost-model.md) — XLM fees + MPC compute per hand
+- [Node Decommission & Secure Reshuffle](docs/node-decommission-reshuffle.md)
+- [Node Build-Provenance Attestation](docs/node-attestation.md)
+- [MPC Session Preemption Policy](docs/mpc-preemption-policy.md)

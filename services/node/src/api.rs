@@ -575,6 +575,35 @@ pub struct ProofResponse {
     pub public_inputs: Vec<String>,
 }
 
+/// POST /session/:id/profile
+///
+/// Enable on-demand CPU/memory profiling for a session (issue #244). Must be
+/// called before the session's proof generation starts.
+pub async fn post_enable_profiling(
+    State(state): State<NodeState>,
+    Path(session_id): Path<String>,
+) -> StatusCode {
+    state.profiling.enable(&session_id).await;
+    StatusCode::ACCEPTED
+}
+
+/// GET /session/:id/profile
+///
+/// Retrieve the resource profile collected for a session (issue #244).
+/// Returns `404` until the session has been enabled and has produced at
+/// least one profiled phase.
+pub async fn get_profile(
+    State(state): State<NodeState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<crate::profiling::SessionProfile>, StatusCode> {
+    state
+        .profiling
+        .get(&session_id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 /// Tests for #241 — coordinator replay protection on session initiation.
 #[cfg(test)]
 mod replay_protection_tests {
@@ -594,6 +623,7 @@ mod replay_protection_tests {
             metrics: NodeMetrics::new(),
             finalized_sessions: Arc::new(RwLock::new(HashSet::new())),
             seen_share_nonces: Arc::new(RwLock::new(HashMap::new())),
+            profiling: crate::profiling::ProfileRegistry::new(),
         }
     }
 
