@@ -5,12 +5,17 @@ mod admin_extended;
 pub mod api_key_admin;
 mod auth;
 pub mod flags;
+pub mod ops;
 mod parsing;
 pub mod plugins;
 mod session;
 pub mod types;
 
 pub use admin_extended::*;
+pub use ops::{
+    admin_cancel_drain, admin_drain_status, admin_rollout_promote, admin_rollout_rollback,
+    admin_rollout_status, admin_start_drain, admin_toggle_maintenance, readiness,
+};
 pub use types::*;
 
 use axum::{

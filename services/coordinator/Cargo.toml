@@ -35,6 +35,8 @@ aes-gcm = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 aws-sdk-kms = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+utoipa-swagger-ui = { version = "6", features = ["axum"] }
 
 [features]
 kms = ["aws-sdk-kms", "aws-config"]
