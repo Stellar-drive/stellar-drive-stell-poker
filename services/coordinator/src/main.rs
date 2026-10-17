@@ -39,6 +39,7 @@ use tower_http::cors::CorsLayer;
 
 mod api;
 mod audit_log;
+mod chain_cache;
 mod cors_db;
 mod db;
 mod feature_flags;
@@ -126,6 +127,7 @@ struct AppState {
     db_pool: Option<Arc<sqlx::PgPool>>,
     instance_id: String,
     pub plugin_loader: Arc<tokio::sync::RwLock<plugin::PluginLoader>>,
+    chain_cache: Arc<chain_cache::ChainCache>,
 }
 
 #[derive(Clone)]
@@ -354,6 +356,9 @@ async fn main() {
     let feature_flag_store = feature_flags::FeatureFlagStore::from_env();
     tracing::info!("Feature flags initialised");
 
+    // Initialize chain cache
+    let chain_cache = Arc::new(chain_cache::ChainCache::new());
+
     // Connect to database if DATABASE_URL is provided
     let db_pool = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         match db::connect(&database_url).await {
@@ -387,8 +392,8 @@ async fn main() {
         .consume_fuel(true)
         .wasm_multi_value(true)
         .wasm_memory64(false);
-    let plugin_engine = wasmtime::Engine::new(&wasm_config)
-        .expect("failed to create wasmtime engine");
+    let plugin_engine =
+        wasmtime::Engine::new(&wasm_config).expect("failed to create wasmtime engine");
     let plugin_loader = plugin::PluginLoader::new(plugin_engine);
     let plugin_loader = Arc::new(tokio::sync::RwLock::new(plugin_loader));
     {
@@ -418,6 +423,7 @@ async fn main() {
         db_pool,
         instance_id,
         plugin_loader,
+        chain_cache,
     };
 
     // Spawn background node health check task
@@ -461,10 +467,7 @@ async fn main() {
         .route("/api/plugins/health", get(api::plugins::plugin_health))
         .route("/api/plugins/load", post(api::plugins::load_plugin))
         .route("/api/plugins/rescan", post(api::plugins::rescan_plugins))
-        .route(
-            "/api/plugins/:name",
-            get(api::plugins::get_plugin),
-        )
+        .route("/api/plugins/:name", get(api::plugins::get_plugin))
         .route(
             "/api/plugins/:name/unload",
             post(api::plugins::unload_plugin),
@@ -604,6 +607,7 @@ struct HealthResponse {
     soroban_rpc: SorobanHealth,
     active_mpc_sessions: usize,
     request_metrics: HashMap<String, RouteMetric>,
+    chain_cache: chain_cache::CacheStats,
 }
 
 #[derive(Serialize)]
@@ -657,6 +661,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
     let active_mpc_sessions = state.metrics.active_mpc_sessions.load(Ordering::SeqCst);
     let request_metrics = state.metrics.route_metrics.lock().await.clone();
+    let chain_cache_stats = state.chain_cache.stats().await;
 
     Json(HealthResponse {
         uptime_seconds,
@@ -667,6 +672,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         },
         active_mpc_sessions,
         request_metrics,
+        chain_cache: chain_cache_stats,
     })
 }
 

@@ -1,13 +1,17 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::{soroban, AppState, TableSession};
 use super::auth::is_valid_stellar_address;
 use super::parsing::{map_onchain_phase_to_local, normalize_field_value, parse_u32_value};
 use super::{MAX_PLAYERS, MIN_PLAYERS};
+use crate::{chain_cache, soroban, AppState, TableSession};
 
-pub(crate) async fn ensure_session_exists(state: &AppState, table_id: u32) -> Result<(), StatusCode> {
+pub(crate) async fn ensure_session_exists(
+    state: &AppState,
+    table_id: u32,
+) -> Result<(), StatusCode> {
     {
         let tables = state.tables.read().await;
         if tables.contains_key(&table_id) {
@@ -94,11 +98,70 @@ pub(crate) async fn fetch_onchain_table_view(
     })
 }
 
+/// Cached version of fetch_onchain_table_view using chain cache.
+pub(crate) async fn fetch_onchain_table_view_cached(
+    soroban_config: &soroban::SorobanConfig,
+    chain_cache: &Arc<chain_cache::ChainCache>,
+    table_id: u32,
+) -> Result<OnchainTableView, String> {
+    let soroban_config = soroban_config.clone();
+    let raw_state = chain_cache
+        .get_table_state(table_id, move |table_ids| {
+            let soroban_config = soroban_config.clone();
+            async move {
+                let mut results = HashMap::new();
+                for id in table_ids {
+                    let result = soroban::get_table_state(&soroban_config, id).await;
+                    results.insert(id, result);
+                }
+                results
+            }
+        })
+        .await?;
+
+    let value: Value =
+        serde_json::from_str(&raw_state).map_err(|e| format!("invalid table json: {}", e))?;
+
+    let phase = value
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .ok_or("missing phase")?
+        .to_string();
+
+    let mut seats: Vec<(u32, String)> = value
+        .get("players")
+        .and_then(|v| v.as_array())
+        .ok_or("missing players")?
+        .iter()
+        .filter_map(|player| {
+            let address = player.get("address")?.as_str()?.to_string();
+            let seat = player
+                .get("seat_index")
+                .and_then(parse_u32_value)
+                .unwrap_or(0);
+            Some((seat, address))
+        })
+        .collect();
+    seats.sort_by_key(|(seat, _)| *seat);
+
+    let max_players = value
+        .get("config")
+        .and_then(|cfg| cfg.get("max_players"))
+        .and_then(parse_u32_value)
+        .unwrap_or_else(|| seats.len() as u32);
+
+    Ok(OnchainTableView {
+        phase,
+        max_players,
+        seats,
+    })
+}
+
 pub(crate) async fn resolve_deal_players_from_lobby(
     state: &AppState,
     table_id: u32,
 ) -> Result<Vec<String>, StatusCode> {
-    let view = fetch_onchain_table_view(&state.soroban_config, table_id)
+    let view = fetch_onchain_table_view_cached(&state.soroban_config, &state.chain_cache, table_id)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
