@@ -26,7 +26,8 @@ use uuid::Uuid;
 
 use crate::{
     anti_dumping, circuit_pins, feature_flags, mpc, mpc_validation, rate_limit, session_cache,
-    session_gc, session_recovery, soroban, AppState, TableSession,
+    session_gc, session_recovery, soroban, try_admit_mpc_session, AppState, PrometheusMetrics,
+    TableSession,
 };
 use auth::{allow_insecure_dev_auth, enforce_rate_limit, validate_signed_request};
 use parsing::{
@@ -139,12 +140,30 @@ async fn attempt_partial_recovery(
 
 pub struct SessionGuard {
     counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    metrics: PrometheusMetrics,
+    node_endpoints: Vec<String>,
+    started_at: std::time::Instant,
+    successful: bool,
 }
 
 impl SessionGuard {
-    pub fn new(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    pub fn new(
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        metrics: &PrometheusMetrics,
+        node_endpoints: &[String],
+    ) -> Self {
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self { counter }
+        Self {
+            counter,
+            metrics: metrics.clone(),
+            node_endpoints: node_endpoints.to_vec(),
+            started_at: std::time::Instant::now(),
+            successful: false,
+        }
+    }
+
+    pub fn mark_success(&mut self) {
+        self.successful = true;
     }
 }
 
@@ -152,7 +171,32 @@ impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.counter
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let duration = self.started_at.elapsed().as_secs_f64();
+        for (index, _) in self.node_endpoints.iter().enumerate() {
+            self.metrics
+                .mpc_prove_duration_seconds
+                .with_label_values(&[&index.to_string()])
+                .observe(duration);
+        }
+        if self.successful {
+            self.metrics.mpc_session_success_total.inc();
+        } else {
+            self.metrics.mpc_session_errors_total.inc();
+        }
     }
+}
+
+/// Refuse *new* MPC sessions when any node advertises drain mode (#571).
+///
+/// In-flight sessions finish on the nodes; the coordinator skips draining
+/// nodes by failing fast with 503 so operators can do planned maintenance.
+async fn reject_if_node_draining(state: &AppState) -> Result<(), StatusCode> {
+    let healths = state.metrics.node_healths.lock().await;
+    if healths.iter().any(|n| n.draining) {
+        tracing::warn!("Rejecting new MPC session: a node is draining");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(())
 }
 
 /// GET /api/chain-config
@@ -285,7 +329,7 @@ pub async fn create_table(
             .insert(auth.address, creator_seat);
     }
 
-    let selected_node_endpoints = select_mpc_nodes(&state, req.region).await?;
+    let selected_node_endpoints = select_mpc_nodes(&state, table_id, req.region).await?;
 
     let table_view = fetch_onchain_table_view(&state.soroban_config, table_id)
         .await
@@ -570,7 +614,7 @@ pub async fn request_deal(
         existing
     } else {
         // This case shouldn't happen if create_table was called, but for robustness:
-        let selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+        let selected_node_endpoints = select_mpc_nodes(&state, table_id, None).await?;
         let new_session = TableSession {
             table_id,
             deck_root: String::new(),
@@ -604,6 +648,8 @@ pub async fn request_deal(
     if node_endpoints.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+
+    reject_if_node_draining(&state).await?;
 
     let deal_span = tracing::info_span!(
         "mpc.deal",
@@ -639,7 +685,14 @@ pub async fn request_deal(
             return Err(StatusCode::CONFLICT);
         }
     }
-    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
+    if !try_admit_mpc_session(&state.metrics.prometheus) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut _guard = SessionGuard::new(
+        state.metrics.active_mpc_sessions.clone(),
+        &state.metrics.prometheus,
+        &node_endpoints,
+    );
     let deal_circuit = parameterised_circuit_name(&req.circuit_name, players.len());
     deal_span.record("circuit", deal_circuit.as_str());
     deal_span.record("proof_session_id", proof_session_id.as_str());
@@ -654,7 +707,10 @@ pub async fn request_deal(
     )
     .await
     {
-        Ok(proof) => proof,
+        Ok(proof) => {
+            _guard.mark_success();
+            proof
+        }
         Err(e) => {
             tracing::error!("Deal proof generation failed: {}", e);
             // Issue #96: a committee node that went down mid-session can't be
@@ -676,26 +732,46 @@ pub async fn request_deal(
             StatusCode::BAD_GATEWAY
         })?;
 
-    let tx_hash = match soroban::submit_deal_proof(
-        &state.soroban_config,
-        table_id,
-        &deal_proof.proof,
-        &deal_proof.public_inputs,
-        &parsed_deal.deck_root,
-        &parsed_deal.hand_commitments,
-    )
-    .await
+    // Issue #592: at-most-once deal submission — skip if already recorded.
+    let tx_hash = if let Ok(Some(cached_hash)) =
+        submission_ledger::check_already_submitted(&state.submission_ledger, &proof_session_id, "deal")
     {
-        Ok(h) if !h.is_empty() => Some(h),
-        Ok(_) => None,
-        Err(e) => {
-            if state.soroban_config.is_configured() {
-                tracing::error!("Soroban deal proof submission failed: {}", e);
-                return Err(StatusCode::BAD_GATEWAY);
+        tracing::info!(
+            session_id = %proof_session_id,
+            "deal proof already submitted — replaying cached tx hash"
+        );
+        Some(cached_hash)
+    } else {
+        let hash = match soroban::submit_deal_proof(
+            &state.soroban_config,
+            table_id,
+            &deal_proof.proof,
+            &deal_proof.public_inputs,
+            &parsed_deal.deck_root,
+            &parsed_deal.hand_commitments,
+        )
+        .await
+        {
+            Ok(h) if !h.is_empty() => Some(h),
+            Ok(_) => None,
+            Err(e) => {
+                if state.soroban_config.is_configured() {
+                    tracing::error!("Soroban deal proof submission failed: {}", e);
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+                tracing::warn!("Soroban deal proof submission skipped/failed: {}", e);
+                None
             }
-            tracing::warn!("Soroban deal proof submission skipped/failed: {}", e);
-            None
+        };
+        if let Some(ref h) = hash {
+            let _ = submission_ledger::record_submission(
+                &state.submission_ledger,
+                &proof_session_id,
+                "deal",
+                h,
+            );
         }
+        hash
     };
 
     let player_card_positions: Vec<(u32, u32)> = (0..players.len())
@@ -783,13 +859,15 @@ pub async fn request_reveal(
     enforce_rate_limit(&state, &headers, table_id, &action).await?;
     rate_limit::check_table_session_cap(&state.mpc_sessions, table_id).await?;
 
+    reject_if_node_draining(&state).await?;
+
     ensure_session_exists(&state, table_id).await?;
 
     let mut tables = state.tables.write().await;
     let session = tables.get_mut(&table_id).ok_or(StatusCode::NOT_FOUND)?;
 
     if session.selected_node_endpoints.is_empty() {
-        session.selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+        session.selected_node_endpoints = select_mpc_nodes(&state, table_id, None).await?;
     }
     let node_endpoints = session.selected_node_endpoints.clone();
 
@@ -901,7 +979,14 @@ pub async fn request_reveal(
         }
     }
     reveal_span.record("proof_session_id", proof_session_id.as_str());
-    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
+    if !try_admit_mpc_session(&state.metrics.prometheus) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut _guard = SessionGuard::new(
+        state.metrics.active_mpc_sessions.clone(),
+        &state.metrics.prometheus,
+        &node_endpoints,
+    );
     let reveal_proof = match mpc::generate_proof_from_share_sets(
         &state.mpc_client,
         table_id,
@@ -913,7 +998,10 @@ pub async fn request_reveal(
     )
     .await
     {
-        Ok(proof) => proof,
+        Ok(proof) => {
+            _guard.mark_success();
+            proof
+        }
         Err(e) => {
             tracing::error!("Reveal proof generation failed: {}", e);
             // Issue #96: see the deal-proof call site above. Issue #235:
@@ -945,26 +1033,50 @@ pub async fn request_reveal(
             StatusCode::BAD_GATEWAY
         })?;
 
-    let tx_hash = match soroban::submit_reveal_proof(
-        &state.soroban_config,
-        table_id,
-        &reveal_proof.proof,
-        &reveal_proof.public_inputs,
-        &parsed_reveal.cards,
-        &parsed_reveal.indices,
-    )
-    .await
-    {
-        Ok(h) if !h.is_empty() => Some(h),
-        Ok(_) => None,
-        Err(e) => {
-            if state.soroban_config.is_configured() {
-                tracing::error!("Soroban reveal proof submission failed: {}", e);
-                return Err(StatusCode::BAD_GATEWAY);
+    // Issue #592: at-most-once reveal submission — skip if already recorded.
+    let reveal_action = format!("reveal-{}", phase);
+    let tx_hash = if let Ok(Some(cached_hash)) = submission_ledger::check_already_submitted(
+        &state.submission_ledger,
+        &proof_session_id,
+        &reveal_action,
+    ) {
+        tracing::info!(
+            session_id = %proof_session_id,
+            phase = %phase,
+            "reveal proof already submitted — replaying cached tx hash"
+        );
+        Some(cached_hash)
+    } else {
+        let hash = match soroban::submit_reveal_proof(
+            &state.soroban_config,
+            table_id,
+            &reveal_proof.proof,
+            &reveal_proof.public_inputs,
+            &parsed_reveal.cards,
+            &parsed_reveal.indices,
+        )
+        .await
+        {
+            Ok(h) if !h.is_empty() => Some(h),
+            Ok(_) => None,
+            Err(e) => {
+                if state.soroban_config.is_configured() {
+                    tracing::error!("Soroban reveal proof submission failed: {}", e);
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+                tracing::warn!("Soroban reveal proof submission skipped/failed: {}", e);
+                None
             }
-            tracing::warn!("Soroban reveal proof submission skipped/failed: {}", e);
-            None
+        };
+        if let Some(ref h) = hash {
+            let _ = submission_ledger::record_submission(
+                &state.submission_ledger,
+                &proof_session_id,
+                &reveal_action,
+                h,
+            );
         }
+        hash
     };
 
     session
@@ -1007,13 +1119,15 @@ pub async fn request_showdown(
     enforce_rate_limit(&state, &headers, table_id, "request_showdown").await?;
     rate_limit::check_table_session_cap(&state.mpc_sessions, table_id).await?;
 
+    reject_if_node_draining(&state).await?;
+
     ensure_session_exists(&state, table_id).await?;
 
     let mut tables = state.tables.write().await;
     let session = tables.get_mut(&table_id).ok_or(StatusCode::NOT_FOUND)?;
 
     if session.selected_node_endpoints.is_empty() {
-        session.selected_node_endpoints = select_mpc_nodes(&state, None).await?;
+        session.selected_node_endpoints = select_mpc_nodes(&state, table_id, None).await?;
     }
     let node_endpoints = session.selected_node_endpoints.clone();
 
@@ -1112,7 +1226,14 @@ pub async fn request_showdown(
     let showdown_circuit = parameterised_circuit_name("showdown_valid", session.player_order.len());
     showdown_span.record("circuit", showdown_circuit.as_str());
     showdown_span.record("proof_session_id", proof_session_id.as_str());
-    let _guard = SessionGuard::new(state.metrics.active_mpc_sessions.clone());
+    if !try_admit_mpc_session(&state.metrics.prometheus) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let mut _guard = SessionGuard::new(
+        state.metrics.active_mpc_sessions.clone(),
+        &state.metrics.prometheus,
+        &node_endpoints,
+    );
     let showdown_proof = match mpc::generate_proof_from_share_sets(
         &state.mpc_client,
         table_id,
@@ -1124,7 +1245,10 @@ pub async fn request_showdown(
     )
     .await
     {
-        Ok(proof) => proof,
+        Ok(proof) => {
+            _guard.mark_success();
+            proof
+        }
         Err(e) => {
             tracing::error!("Showdown proof generation failed: {}", e);
             // Issue #96: see the deal-proof call site above. Issue #235:
@@ -1164,49 +1288,72 @@ pub async fn request_showdown(
     }
     let winner = session.player_order[parsed_showdown.winner_index as usize].clone();
 
-    let (tx_hash, settled_by_timeout) = match soroban::submit_showdown_proof(
-        &state.soroban_config,
-        table_id,
-        &showdown_proof.proof,
-        &showdown_proof.public_inputs,
-        &parsed_showdown.hole_cards,
-    )
-    .await
-    {
-        Ok(h) if !h.is_empty() => (Some(h), false),
-        Ok(_) => (None, false),
-        Err(e) => {
-            if state.soroban_config.is_configured() {
-                tracing::error!("Soroban showdown proof submission failed: {}", e);
-                match soroban::claim_timeout(&state.soroban_config, table_id).await {
-                    Ok(h) if !h.is_empty() => {
-                        tracing::warn!(
-                            "Showdown proof rejected on-chain; settled table {} via timeout fallback",
-                            table_id
-                        );
-                        (Some(h), true)
+    // Issue #592: at-most-once showdown submission — skip if already recorded.
+    let (tx_hash, settled_by_timeout) = if let Ok(Some(cached_hash)) =
+        submission_ledger::check_already_submitted(
+            &state.submission_ledger,
+            &proof_session_id,
+            "showdown",
+        ) {
+        tracing::info!(
+            session_id = %proof_session_id,
+            "showdown proof already submitted — replaying cached tx hash"
+        );
+        (Some(cached_hash), false)
+    } else {
+        let result = match soroban::submit_showdown_proof(
+            &state.soroban_config,
+            table_id,
+            &showdown_proof.proof,
+            &showdown_proof.public_inputs,
+            &parsed_showdown.hole_cards,
+        )
+        .await
+        {
+            Ok(h) if !h.is_empty() => (Some(h), false),
+            Ok(_) => (None, false),
+            Err(e) => {
+                if state.soroban_config.is_configured() {
+                    tracing::error!("Soroban showdown proof submission failed: {}", e);
+                    match soroban::claim_timeout(&state.soroban_config, table_id).await {
+                        Ok(h) if !h.is_empty() => {
+                            tracing::warn!(
+                                "Showdown proof rejected on-chain; settled table {} via timeout fallback",
+                                table_id
+                            );
+                            (Some(h), true)
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                "Showdown proof rejected on-chain; timeout fallback returned empty hash for table {}",
+                                table_id
+                            );
+                            (None, true)
+                        }
+                        Err(timeout_err) => {
+                            tracing::error!(
+                                "Showdown proof rejected and timeout fallback failed for table {}: {}",
+                                table_id,
+                                timeout_err
+                            );
+                            return Err(StatusCode::BAD_GATEWAY);
+                        }
                     }
-                    Ok(_) => {
-                        tracing::warn!(
-                            "Showdown proof rejected on-chain; timeout fallback returned empty hash for table {}",
-                            table_id
-                        );
-                        (None, true)
-                    }
-                    Err(timeout_err) => {
-                        tracing::error!(
-                            "Showdown proof rejected and timeout fallback failed for table {}: {}",
-                            table_id,
-                            timeout_err
-                        );
-                        return Err(StatusCode::BAD_GATEWAY);
-                    }
+                } else {
+                    tracing::warn!("Soroban showdown proof submission skipped/failed: {}", e);
+                    (None, false)
                 }
-            } else {
-                tracing::warn!("Soroban showdown proof submission skipped/failed: {}", e);
-                (None, false)
             }
+        };
+        if let Some(ref h) = result.0 {
+            let _ = submission_ledger::record_submission(
+                &state.submission_ledger,
+                &proof_session_id,
+                "showdown",
+                h,
+            );
         }
+        result
     };
 
     let is_rit_run1 = session.phase == "showdown_run1";
@@ -1714,7 +1861,7 @@ pub async fn get_player_cards(
 
     let mut node_endpoints = session.selected_node_endpoints.clone();
     if node_endpoints.is_empty() {
-        node_endpoints = select_mpc_nodes(&state, None).await?;
+        node_endpoints = select_mpc_nodes(&state, table_id, None).await?;
     }
     let positions = vec![*pos1, *pos2];
     let hand_commitment = session.hand_commitments.get(player_index).cloned();
@@ -1975,11 +2122,13 @@ pub async fn committee_status(State(state): State<AppState>) -> Json<CommitteeSt
     let healths = state.metrics.node_healths.lock().await;
     let nodes = healths.len();
     let healthy = healths.iter().map(|h| h.connected).collect();
+    let draining = healths.iter().map(|h| h.draining).collect();
 
     Json(CommitteeStatusResponse {
         nodes,
         healthy,
         status: "active".to_string(),
+        draining,
     })
 }
 
@@ -2359,6 +2508,7 @@ pub async fn admin_stats(
     let total_requests: u64 = route_metrics.values().map(|m| m.count).sum();
     let total_errors: u64 = route_metrics.values().map(|m| m.errors).sum();
     let healthy_nodes = node_healths.iter().filter(|n| n.connected).count();
+    let draining_nodes = node_healths.iter().filter(|n| n.draining).count();
 
     Ok(Json(serde_json::json!({
         "uptime_seconds": uptime,
@@ -2367,6 +2517,7 @@ pub async fn admin_stats(
         "total_errors": total_errors,
         "healthy_nodes": healthy_nodes,
         "total_nodes": node_healths.len(),
+        "draining_nodes": draining_nodes,
         "route_metrics": route_metrics,
         "admin": {
             "address": auth.address,

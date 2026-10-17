@@ -26,17 +26,17 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use prometheus::{
-    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts,
+    Registry, TextEncoder,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use sysinfo::{get_current_pid, ProcessesToUpdate, System};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{RwLock, Mutex};
 use tower_http::cors::CorsLayer;
+use sysinfo::{get_current_pid, ProcessesToUpdate, System};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -88,10 +88,12 @@ mod session_preemption;
 mod session_recovery;
 mod soroban;
 mod spectators;
+mod submission_ledger;
 mod stats;
 mod telemetry;
 mod tls_client;
 mod tournament;
+mod transcript_log;
 
 use api::admin::{AdminConfig, AdminState};
 use api::MpcNodeProgress;
@@ -129,6 +131,9 @@ pub struct MpcNodeHealth {
     pub endpoint: String,
     pub connected: bool,
     pub last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when the node advertises drain mode for planned maintenance (#571).
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -247,6 +252,8 @@ pub struct PrometheusMetrics {
     pub request_latency: HistogramVec,
     pub process_cpu_percent: Gauge,
     pub process_memory_bytes: Gauge,
+    /// 1 when the node reports draining, 0 otherwise (label: endpoint).
+    pub node_draining: GaugeVec,
     /// CSP violation reports accepted by `POST /api/csp/report` (issue #136).
     pub csp_reports_total: IntCounter,
     /// CSP reports rejected by ingestion validation, labelled by reason
@@ -255,6 +262,11 @@ pub struct PrometheusMetrics {
     /// CSP violations by sanitized `effective_directive` and `disposition`
     /// labels (issue #136).
     pub csp_violations_total: IntCounterVec,
+    pub mpc_session_success_total: IntCounter,
+    pub mpc_session_errors_total: IntCounter,
+    pub mpc_session_refusals_total: IntCounter,
+    pub mpc_prove_duration_seconds: HistogramVec,
+    pub memory_watermark_bytes: Gauge,
 }
 
 impl PrometheusMetrics {
@@ -296,6 +308,14 @@ impl PrometheusMetrics {
             "Coordinator process memory usage in bytes.",
         ))
         .unwrap();
+        let node_draining = GaugeVec::new(
+            Opts::new(
+                "coordinator_mpc_node_draining",
+                "1 when the MPC node advertises drain mode, 0 otherwise.",
+            ),
+            &["endpoint"],
+        )
+        .unwrap();
         let csp_reports_total = IntCounter::new(
             "coordinator_csp_reports_total",
             "Total CSP violation reports ingested.",
@@ -317,6 +337,35 @@ impl PrometheusMetrics {
             &["effective_directive", "disposition"],
         )
         .unwrap();
+        let mpc_session_success_total = IntCounter::new(
+            "coordinator_mpc_session_success_total",
+            "MPC proof sessions completed successfully.",
+        )
+        .unwrap();
+        let mpc_session_errors_total = IntCounter::new(
+            "coordinator_mpc_session_errors_total",
+            "MPC proof sessions that ended with an error.",
+        )
+        .unwrap();
+        let mpc_session_refusals_total = IntCounter::new(
+            "coordinator_mpc_session_refusals_total",
+            "New MPC sessions refused at the memory watermark.",
+        )
+        .unwrap();
+        let mpc_prove_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "coordinator_mpc_prove_duration_seconds",
+                "MPC proof duration by committee node.",
+            )
+            .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0]),
+            &["node_id"],
+        )
+        .unwrap();
+        let memory_watermark_bytes = Gauge::with_opts(Opts::new(
+            "coordinator_memory_watermark_bytes",
+            "Configured process memory watermark for new MPC sessions.",
+        ))
+        .unwrap();
 
         registry
             .register(Box::new(request_counter.clone()))
@@ -334,6 +383,9 @@ impl PrometheusMetrics {
             .register(Box::new(process_memory_bytes.clone()))
             .unwrap();
         registry
+            .register(Box::new(node_draining.clone()))
+            .unwrap();
+        registry
             .register(Box::new(csp_reports_total.clone()))
             .unwrap();
         registry
@@ -341,6 +393,21 @@ impl PrometheusMetrics {
             .unwrap();
         registry
             .register(Box::new(csp_violations_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_session_success_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_session_errors_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_session_refusals_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_prove_duration_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(memory_watermark_bytes.clone()))
             .unwrap();
 
         Self {
@@ -350,10 +417,61 @@ impl PrometheusMetrics {
             request_latency,
             process_cpu_percent,
             process_memory_bytes,
+            node_draining,
             csp_reports_total,
             csp_reports_rejected_total,
             csp_violations_total,
+            mpc_session_success_total,
+            mpc_session_errors_total,
+            mpc_session_refusals_total,
+            mpc_prove_duration_seconds,
+            memory_watermark_bytes,
         }
+    }
+}
+
+pub(crate) fn memory_watermark_bytes() -> u64 {
+    std::env::var("COORDINATOR_MEMORY_WATERMARK_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn try_admit_mpc_session(metrics: &PrometheusMetrics) -> bool {
+    let watermark = metrics.memory_watermark_bytes.get() as u64;
+    let current = metrics.process_memory_bytes.get() as u64;
+    if watermark > 0 && current >= watermark {
+        metrics.mpc_session_refusals_total.inc();
+        tracing::warn!(current_bytes = current, watermark_bytes = watermark,
+            "refusing new MPC session at memory watermark");
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+mod memory_admission_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_new_session_at_watermark() {
+        let metrics = PrometheusMetrics::new();
+        metrics.memory_watermark_bytes.set(100.0);
+        metrics.process_memory_bytes.set(100.0);
+
+        assert!(!try_admit_mpc_session(&metrics));
+        assert_eq!(metrics.mpc_session_refusals_total.get(), 1);
+    }
+
+    #[test]
+    fn admits_new_session_below_watermark() {
+        let metrics = PrometheusMetrics::new();
+        metrics.memory_watermark_bytes.set(100.0);
+        metrics.process_memory_bytes.set(99.0);
+
+        assert!(try_admit_mpc_session(&metrics));
+        assert_eq!(metrics.mpc_session_refusals_total.get(), 0);
     }
 }
 
@@ -417,6 +535,9 @@ struct AppState {
     /// A session ID that has already been used is rejected to prevent replay
     /// attacks on deal/reveal/showdown proofs.
     used_session_ids: Arc<RwLock<HashSet<String>>>,
+    /// At-most-once Soroban proof submission ledger (Issue #592).
+    /// Prevents duplicate on-chain submissions on coordinator retries.
+    submission_ledger: submission_ledger::SubmissionLedgerStore,
     /// Anti-chip-dumping detector fed with settled hand outcomes (Issue #504).
     /// Kept as `Arc<Mutex<_>>` because it is mutated from showdown handlers and
     /// read by the admin report endpoint.
@@ -467,6 +588,8 @@ struct MpcConfig {
     /// (vs. built-in localhost defaults). When true, dynamic node discovery is
     /// disabled and these static endpoints are used (backward compatibility).
     static_endpoints_configured: bool,
+    /// Opt-in deterministic table-to-committee affinity for larger committees.
+    table_affinity_enabled: bool,
     /// Path to compiled Noir circuits (ACIR)
     circuit_dir: String,
     /// Soroban RPC endpoint
@@ -583,6 +706,9 @@ async fn main() {
             std::env::var("MPC_NODE_2").unwrap_or_else(|_| "http://localhost:8103".to_string()),
         ],
         static_endpoints_configured,
+        table_affinity_enabled: std::env::var("MPC_TABLE_AFFINITY_ENABLED")
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false),
         circuit_dir: std::env::var("CIRCUIT_DIR").unwrap_or_else(|_| "./circuits".to_string()),
         soroban_rpc: std::env::var("SOROBAN_RPC")
             .unwrap_or_else(|_| "http://localhost:8000/soroban/rpc".to_string()),
@@ -616,6 +742,7 @@ async fn main() {
             endpoint: ep.clone(),
             connected: false,
             last_heartbeat: None,
+            draining: false,
         })
         .collect::<Vec<_>>();
 
@@ -626,6 +753,10 @@ async fn main() {
         node_healths: Arc::new(Mutex::new(initial_node_healths)),
         prometheus: PrometheusMetrics::new(),
     };
+    metrics
+        .prometheus
+        .memory_watermark_bytes
+        .set(memory_watermark_bytes() as f64);
 
     let system_state = Arc::new(Mutex::new(System::new_all()));
     let mpc_sessions: session_gc::SessionStore =
@@ -836,6 +967,10 @@ async fn main() {
         benchmark_store,
         committee_key_rotation,
         used_session_ids: Arc::new(RwLock::new(HashSet::new())),
+        submission_ledger: submission_ledger::new_store(
+            &std::env::var("SUBMISSION_LEDGER_DB_PATH")
+                .unwrap_or_else(|_| "./data/submission_ledger.db".to_string()),
+        ),
         anti_dumping: Arc::new(std::sync::Mutex::new(
             anti_dumping::DumpingDetector::with_default_config(),
         )),
@@ -992,6 +1127,7 @@ async fn main() {
 
     // Spawn background node health check task
     let node_healths = state.metrics.node_healths.clone();
+    let node_draining_gauge = state.metrics.prometheus.node_draining.clone();
     let soroban_config = state.soroban_config.clone();
     let default_endpoints = state.mpc_config.node_endpoints.clone();
     let hc_client = state.mpc_client.clone();
@@ -1076,26 +1212,39 @@ async fn main() {
                 let mut guard = node_healths.lock().await;
                 if let Some(node) = guard.iter_mut().find(|n| n.endpoint == endpoint) {
                     let prev_connected = node.connected;
+                    let prev_draining = node.draining;
                     if is_healthy {
                         node.connected = true;
                         node.last_heartbeat = Some(chrono::Utc::now());
+                        node.draining = is_draining;
+                        if is_draining && !prev_draining {
+                            tracing::warn!("MPC Node ({}) entered DRAIN mode", endpoint);
+                        }
                     } else {
                         if prev_connected {
                             tracing::warn!("MPC Node ({}) went offline", endpoint);
                         }
                         node.connected = false;
+                        node.draining = false;
                     }
+                    node_draining_gauge
+                        .with_label_values(&[endpoint.as_str()])
+                        .set(if node.draining { 1.0 } else { 0.0 });
                 } else {
                     // New node discovered
                     guard.push(MpcNodeHealth {
-                        endpoint,
+                        endpoint: endpoint.clone(),
                         connected: is_healthy,
                         last_heartbeat: if is_healthy {
                             Some(chrono::Utc::now())
                         } else {
                             None
                         },
+                        draining: is_draining,
                     });
+                    node_draining_gauge
+                        .with_label_values(&[endpoint.as_str()])
+                        .set(if is_draining { 1.0 } else { 0.0 });
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -1869,7 +2018,23 @@ async fn negotiate_version(
         .unwrap_or_default();
     let circuit_refs: Vec<&str> = circuit_names.iter().map(|s| s.as_str()).collect();
 
-    mpc_version::negotiate_session(&state.version_registry, &node_ids, &circuit_refs)
+    let channel = params
+        .get("channel")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .or_else(|| std::env::var("COORDINATOR_RELEASE_CHANNEL").ok())
+        .unwrap_or_else(|| "stable".to_string());
+    let channel = match channel.as_str() {
+        "stable" => mpc_version::ReleaseChannel::Stable,
+        "canary" => mpc_version::ReleaseChannel::Canary,
+        _ => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "channel must be stable or canary".to_string(),
+            ))
+        }
+    };
+
+    mpc_version::negotiate_session(&state.version_registry, &node_ids, &circuit_refs, channel)
         .await
         .map(Json)
         .map_err(|e| (axum::http::StatusCode::CONFLICT, e))

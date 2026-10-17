@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use uuid;
 
 use super::auth::is_valid_stellar_address;
@@ -361,18 +362,20 @@ pub(crate) fn dynamic_discovery_active(state: &AppState) -> bool {
 /// Select 3 healthy MPC nodes, prioritizing those in the requested region.
 pub(crate) async fn select_mpc_nodes(
     state: &AppState,
+    table_id: u32,
     requested_region: Option<String>,
 ) -> Result<Vec<String>, StatusCode> {
     // Dynamic discovery: choose from nodes that self-registered at runtime and
     // are still heartbeating. The registry enforces the 3-healthy-node minimum
     // (returning None -> 503) just like the registry/static paths below.
     if dynamic_discovery_active(state) {
-        return state
+        let endpoints = state
             .node_registry
             .read()
             .await
             .select_session_nodes()
-            .ok_or(StatusCode::SERVICE_UNAVAILABLE);
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        return Ok(order_for_table(endpoints, table_id, state.mpc_config.table_affinity_enabled));
     }
 
     let all_nodes = if state.soroban_config.committee_registry_contract.is_empty() {
@@ -424,12 +427,33 @@ pub(crate) async fn select_mpc_nodes(
         healthy_members.sort_by_key(|m| m.region != *region);
     }
 
+    if state.mpc_config.table_affinity_enabled {
+        healthy_members.sort_by_key(|member| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            table_id.hash(&mut hasher);
+            member.endpoint.hash(&mut hasher);
+            hasher.finish()
+        });
+    }
+
     let selected = healthy_members
         .into_iter()
         .take(3)
         .map(|m| m.endpoint)
         .collect();
     Ok(selected)
+}
+
+fn order_for_table(mut endpoints: Vec<String>, table_id: u32, enabled: bool) -> Vec<String> {
+    if enabled {
+        endpoints.sort_by_key(|endpoint| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            table_id.hash(&mut hasher);
+            endpoint.hash(&mut hasher);
+            hasher.finish()
+        });
+    }
+    endpoints
 }
 
 pub(crate) fn is_identity_missing_error(error: &str) -> bool {

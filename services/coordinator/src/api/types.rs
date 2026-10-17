@@ -113,6 +113,9 @@ pub struct CommitteeStatusResponse {
     pub nodes: usize,
     pub healthy: Vec<bool>,
     pub status: String,
+    /// Per-node drain flags (#571); true = node refuses new sessions.
+    #[serde(default)]
+    pub draining: Vec<bool>,
 }
 
 #[derive(Deserialize, ToSchema)]
