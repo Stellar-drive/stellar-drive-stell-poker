@@ -67,6 +67,26 @@ pub async fn set_flag(
         return StatusCode::BAD_REQUEST;
     }
     state.feature_flags.set_flag(&key, body.enabled).await;
+
+    // Issue #603: runtime flag changes had no audit trail — reuse the
+    // existing compliance audit log rather than inventing a new store.
+    if let Some(pool) = &state.db_pool {
+        let _ = crate::audit_log::log_audit_entry(
+            pool,
+            uuid::Uuid::new_v4(),
+            None,
+            "feature_flag_changed",
+            &format!("/api/flags/{key}"),
+            &axum::http::Method::POST,
+            None,
+            Some(200),
+            None,
+            None,
+            None,
+        )
+        .await;
+    }
+
     StatusCode::OK
 }
 
