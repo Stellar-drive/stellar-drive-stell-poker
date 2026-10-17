@@ -37,7 +37,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 mod api;
-mod cost;
+mod attestation;
 mod gossip;
 mod heartbeat;
 mod limits;
@@ -81,6 +81,8 @@ pub struct NodeState {
     pub finalized_sessions: Arc<RwLock<HashSet<String>>>,
     /// Replay protection: (session_id, source_party_id) -> seen nonces (Issue #500).
     pub seen_share_nonces: Arc<RwLock<HashMap<(String, u32), HashSet<u64>>>>,
+    /// On-demand per-session CPU/memory profiling (Issue #244).
+    pub profiling: ProfileRegistry,
 }
 
 fn drain_mode_from_env() -> bool {
@@ -213,6 +215,7 @@ async fn main() {
         metrics: NodeMetrics::new(),
         finalized_sessions: Arc::new(RwLock::new(HashSet::new())),
         seen_share_nonces: Arc::new(RwLock::new(HashMap::new())),
+        profiling: ProfileRegistry::new(),
     };
 
     // ── Peer connection pool health checks (Issue #246) ─────────────────────
@@ -220,6 +223,17 @@ async fn main() {
 
     // ── Proactive share refresh task (Issue #242) ───────────────────────────
     private_table::spawn_share_refresh_task(state.tables.clone(), peer_http_endpoints, node_id);
+
+    // ── Build provenance attestation reporter (Issue #587) ──────────────────
+    // Reports the hash of this node's own binary to the coordinator so it can
+    // refuse to hand committee work to unattested peers in strict mode.
+    if let Ok(coordinator_url) = std::env::var("COORDINATOR_URL") {
+        let interval = std::env::var("MPC_ATTESTATION_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300);
+        attestation::spawn_attestation_reporter(node_id, coordinator_url, interval);
+    }
 
     // ── Background metric updaters ────────────────────────────────────────────
     {
