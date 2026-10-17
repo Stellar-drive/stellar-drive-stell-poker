@@ -155,6 +155,19 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Refuse *new* MPC sessions when any node advertises drain mode (#571).
+///
+/// In-flight sessions finish on the nodes; the coordinator skips draining
+/// nodes by failing fast with 503 so operators can do planned maintenance.
+async fn reject_if_node_draining(state: &AppState) -> Result<(), StatusCode> {
+    let healths = state.metrics.node_healths.lock().await;
+    if healths.iter().any(|n| n.draining) {
+        tracing::warn!("Rejecting new MPC session: a node is draining");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(())
+}
+
 /// GET /api/chain-config
 ///
 /// Public chain parameters used by the frontend for wallet-signed
@@ -605,6 +618,8 @@ pub async fn request_deal(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    reject_if_node_draining(&state).await?;
+
     let deal_span = tracing::info_span!(
         "mpc.deal",
         table_id = table_id,
@@ -802,6 +817,8 @@ pub async fn request_reveal(
     let action = format!("request_reveal:{}", phase);
     enforce_rate_limit(&state, &headers, table_id, &action).await?;
     rate_limit::check_table_session_cap(&state.mpc_sessions, table_id).await?;
+
+    reject_if_node_draining(&state).await?;
 
     ensure_session_exists(&state, table_id).await?;
 
@@ -1050,6 +1067,8 @@ pub async fn request_showdown(
 
     enforce_rate_limit(&state, &headers, table_id, "request_showdown").await?;
     rate_limit::check_table_session_cap(&state.mpc_sessions, table_id).await?;
+
+    reject_if_node_draining(&state).await?;
 
     ensure_session_exists(&state, table_id).await?;
 
@@ -2042,11 +2061,13 @@ pub async fn committee_status(State(state): State<AppState>) -> Json<CommitteeSt
     let healths = state.metrics.node_healths.lock().await;
     let nodes = healths.len();
     let healthy = healths.iter().map(|h| h.connected).collect();
+    let draining = healths.iter().map(|h| h.draining).collect();
 
     Json(CommitteeStatusResponse {
         nodes,
         healthy,
         status: "active".to_string(),
+        draining,
     })
 }
 
@@ -2426,6 +2447,7 @@ pub async fn admin_stats(
     let total_requests: u64 = route_metrics.values().map(|m| m.count).sum();
     let total_errors: u64 = route_metrics.values().map(|m| m.errors).sum();
     let healthy_nodes = node_healths.iter().filter(|n| n.connected).count();
+    let draining_nodes = node_healths.iter().filter(|n| n.draining).count();
 
     Ok(Json(serde_json::json!({
         "uptime_seconds": uptime,
@@ -2434,6 +2456,7 @@ pub async fn admin_stats(
         "total_errors": total_errors,
         "healthy_nodes": healthy_nodes,
         "total_nodes": node_healths.len(),
+        "draining_nodes": draining_nodes,
         "route_metrics": route_metrics,
         "admin": {
             "address": auth.address,

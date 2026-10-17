@@ -1684,6 +1684,46 @@ impl PokerTableContract {
         load_table(&env, table_id)
     }
 
+    /// Export a versioned full-table snapshot for replay tools (#570).
+    ///
+    /// Contains stacks, seats, phase, button (`dealer_seat`) and config in
+    /// the stable `TableExportV1` format (`version == TABLE_EXPORT_VERSION`).
+    /// Read-only view consumed by the hand replayer
+    /// (`scripts/replay-table.py`); it provides the initial state a
+    /// replayer seeds from before applying the on-chain action history.
+    pub fn export_table_state(env: Env, table_id: u32) -> Result<TableExportV1, PokerTableError> {
+        let table = load_table(&env, table_id)?;
+        let mut seats = Vec::new(&env);
+        for i in 0..table.players.len() {
+            let p = table
+                .players
+                .get(i)
+                .ok_or(PokerTableError::InvalidPlayerIndex)?;
+            seats.push_back(ExportSeat {
+                seat_index: p.seat_index,
+                address: p.address,
+                stack: p.stack,
+                bet_this_round: p.bet_this_round,
+                committed: p.committed,
+                folded: p.folded,
+                all_in: p.all_in,
+                sitting_out: p.sitting_out,
+            });
+        }
+        Ok(TableExportV1 {
+            version: TABLE_EXPORT_VERSION,
+            table_id: table.id,
+            phase: table.phase,
+            dealer_seat: table.dealer_seat,
+            current_turn: table.current_turn,
+            hand_number: table.hand_number,
+            pot: table.pot,
+            seats,
+            board_cards: table.board_cards,
+            config: table.config,
+        })
+    }
+
     /// Configure an optional 2x/3x big-blind straddle for future hands (legacy entrypoint, backward compat).
     pub fn configure_straddle(
         env: Env,
