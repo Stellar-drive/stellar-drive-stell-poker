@@ -26,17 +26,17 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use prometheus::{
-    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts,
+    Registry, TextEncoder,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use sysinfo::{get_current_pid, ProcessesToUpdate, System};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{RwLock, Mutex};
 use tower_http::cors::CorsLayer;
+use sysinfo::{get_current_pid, ProcessesToUpdate, System};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -127,6 +127,9 @@ pub struct MpcNodeHealth {
     pub endpoint: String,
     pub connected: bool,
     pub last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when the node advertises drain mode for planned maintenance (#571).
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -245,6 +248,8 @@ pub struct PrometheusMetrics {
     pub request_latency: HistogramVec,
     pub process_cpu_percent: Gauge,
     pub process_memory_bytes: Gauge,
+    /// 1 when the node reports draining, 0 otherwise (label: endpoint).
+    pub node_draining: GaugeVec,
     /// CSP violation reports accepted by `POST /api/csp/report` (issue #136).
     pub csp_reports_total: IntCounter,
     /// CSP reports rejected by ingestion validation, labelled by reason
@@ -294,6 +299,14 @@ impl PrometheusMetrics {
             "Coordinator process memory usage in bytes.",
         ))
         .unwrap();
+        let node_draining = GaugeVec::new(
+            Opts::new(
+                "coordinator_mpc_node_draining",
+                "1 when the MPC node advertises drain mode, 0 otherwise.",
+            ),
+            &["endpoint"],
+        )
+        .unwrap();
         let csp_reports_total = IntCounter::new(
             "coordinator_csp_reports_total",
             "Total CSP violation reports ingested.",
@@ -332,6 +345,9 @@ impl PrometheusMetrics {
             .register(Box::new(process_memory_bytes.clone()))
             .unwrap();
         registry
+            .register(Box::new(node_draining.clone()))
+            .unwrap();
+        registry
             .register(Box::new(csp_reports_total.clone()))
             .unwrap();
         registry
@@ -348,6 +364,7 @@ impl PrometheusMetrics {
             request_latency,
             process_cpu_percent,
             process_memory_bytes,
+            node_draining,
             csp_reports_total,
             csp_reports_rejected_total,
             csp_violations_total,
@@ -609,6 +626,7 @@ async fn main() {
             endpoint: ep.clone(),
             connected: false,
             last_heartbeat: None,
+            draining: false,
         })
         .collect::<Vec<_>>();
 
@@ -981,6 +999,7 @@ async fn main() {
 
     // Spawn background node health check task
     let node_healths = state.metrics.node_healths.clone();
+    let node_draining_gauge = state.metrics.prometheus.node_draining.clone();
     let soroban_config = state.soroban_config.clone();
     let default_endpoints = state.mpc_config.node_endpoints.clone();
     let hc_client = state.mpc_client.clone();
@@ -1003,36 +1022,57 @@ async fn main() {
 
             for endpoint in endpoints {
                 let url = format!("{}/health", endpoint);
-                let is_healthy = hc_client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
+                // Nodes advertise `{status, draining, node_id}` (#571); older
+                // nodes reply plain "ok", which parses as not-draining.
+                let (is_healthy, is_draining) = match hc_client.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        let draining = resp
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| v.get("draining").and_then(|d| d.as_bool()))
+                            .unwrap_or(false);
+                        (true, draining)
+                    }
+                    _ => (false, false),
+                };
 
                 let mut guard = node_healths.lock().await;
                 if let Some(node) = guard.iter_mut().find(|n| n.endpoint == endpoint) {
                     let prev_connected = node.connected;
+                    let prev_draining = node.draining;
                     if is_healthy {
                         node.connected = true;
                         node.last_heartbeat = Some(chrono::Utc::now());
+                        node.draining = is_draining;
+                        if is_draining && !prev_draining {
+                            tracing::warn!("MPC Node ({}) entered DRAIN mode", endpoint);
+                        }
                     } else {
                         if prev_connected {
                             tracing::warn!("MPC Node ({}) went offline", endpoint);
                         }
                         node.connected = false;
+                        node.draining = false;
                     }
+                    node_draining_gauge
+                        .with_label_values(&[endpoint.as_str()])
+                        .set(if node.draining { 1.0 } else { 0.0 });
                 } else {
                     // New node discovered
                     guard.push(MpcNodeHealth {
-                        endpoint,
+                        endpoint: endpoint.clone(),
                         connected: is_healthy,
                         last_heartbeat: if is_healthy {
                             Some(chrono::Utc::now())
                         } else {
                             None
                         },
+                        draining: is_draining,
                     });
+                    node_draining_gauge
+                        .with_label_values(&[endpoint.as_str()])
+                        .set(if is_draining { 1.0 } else { 0.0 });
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
