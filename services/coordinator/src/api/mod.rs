@@ -345,12 +345,16 @@ pub async fn create_table(
 
     let selected_node_endpoints = select_mpc_nodes(&state, table_id, req.region).await?;
 
-    let table_view = fetch_onchain_table_view(&state.soroban_config, table_id)
-        .await
-        .map_err(|e| {
-            tracing::error!("create_table fetch failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+    let table_view = session::fetch_onchain_table_view_cached(
+        &state.soroban_config,
+        &state.chain_cache,
+        table_id,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("create_table fetch failed: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let session = TableSession {
         table_id,
@@ -402,7 +406,13 @@ pub async fn list_open_tables(
         .unwrap_or(32);
     let mut tables = Vec::new();
     for table_id in 0..scan_max {
-        let Ok(view) = fetch_onchain_table_view(&state.soroban_config, table_id).await else {
+        let Ok(view) = session::fetch_onchain_table_view_cached(
+            &state.soroban_config,
+            &state.chain_cache,
+            table_id,
+        )
+        .await
+        else {
             continue;
         };
 
@@ -514,9 +524,13 @@ pub async fn join_table(
     enforce_rate_limit(&state, &headers, table_id, "join_table").await?;
     let auth = validate_signed_request(&state, &headers, table_id, "join_table", None).await?;
 
-    let view = fetch_onchain_table_view(&state.soroban_config, table_id)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let view = session::fetch_onchain_table_view_cached(
+        &state.soroban_config,
+        &state.chain_cache,
+        table_id,
+    )
+    .await
+    .map_err(|_| StatusCode::NOT_FOUND)?;
     if view.phase != "Waiting" {
         return Err(StatusCode::CONFLICT);
     }
@@ -552,9 +566,13 @@ pub async fn get_table_lobby(
     Path(table_id): Path<u32>,
 ) -> Result<Json<TableLobbyResponse>, StatusCode> {
     validate_table_id(table_id)?;
-    let view = fetch_onchain_table_view(&state.soroban_config, table_id)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let view = session::fetch_onchain_table_view_cached(
+        &state.soroban_config,
+        &state.chain_cache,
+        table_id,
+    )
+    .await
+    .map_err(|_| StatusCode::NOT_FOUND)?;
     let lobby = state.lobby_assignments.read().await;
     let table_lobby = lobby.get(&table_id);
 
@@ -851,6 +869,9 @@ pub async fn request_deal(
 
     broadcast_table_state(&state, table_id).await;
 
+    // Invalidate cache after state change
+    state.chain_cache.invalidate(table_id).await;
+
     Ok(Json(DealResponse {
         status: "dealt".to_string(),
         deck_root: parsed_deal.deck_root,
@@ -1114,6 +1135,10 @@ pub async fn request_reveal(
     drop(tables);
 
     broadcast_table_state(&state, table_id).await;
+
+    // Invalidate cache after state change
+    drop(tables);
+    state.chain_cache.invalidate(table_id).await;
 
     Ok(Json(RevealResponse {
         status: "revealed".to_string(),
@@ -1462,6 +1487,9 @@ pub async fn request_showdown(
 
     broadcast_table_state(&state, table_id).await;
 
+    // Invalidate cache after state change
+    state.chain_cache.invalidate(table_id).await;
+
     Ok(Json(ShowdownResponse {
         status,
         winner,
@@ -1574,10 +1602,14 @@ pub async fn player_action(
             .cloned()
     };
 
-    let caller_is_seated = fetch_onchain_table_view(&state.soroban_config, table_id)
-        .await
-        .map(|view| view.seats.iter().any(|(_, chain)| chain == &auth.address))
-        .unwrap_or(false);
+    let caller_is_seated = session::fetch_onchain_table_view_cached(
+        &state.soroban_config,
+        &state.chain_cache,
+        table_id,
+    )
+    .await
+    .map(|view| view.seats.iter().any(|(_, chain)| chain == &auth.address))
+    .unwrap_or(false);
 
     let player_address = if let Some(mapped) = mapped_player {
         mapped

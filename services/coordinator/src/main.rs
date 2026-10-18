@@ -46,6 +46,7 @@ mod api_keys;
 mod api_version;
 mod archiver;
 mod audit_log;
+mod chain_cache;
 mod bandwidth;
 mod chat;
 mod circuit_pins;
@@ -170,7 +171,9 @@ struct HealthResponse {
     pub maintenance_mode: bool,
     /// True while the coordinator is draining for a blue-green cutover.
     pub draining: bool,
-    pub maintenance_mode: bool,
+    /// Chain-state cache hit/miss statistics.
+    #[schema(value_type = Object)]
+    pub chain_cache: chain_cache::CacheStats,
 }
 
 #[derive(OpenApi)]
@@ -537,6 +540,7 @@ struct AppState {
     db_pool: Option<Arc<sqlx::PgPool>>,
     instance_id: String,
     pub plugin_loader: Arc<tokio::sync::RwLock<plugin::PluginLoader>>,
+    chain_cache: Arc<chain_cache::ChainCache>,
     /// Shared key ring for encrypting sensitive in-memory fields.
     enc_key: Arc<crypto::EncryptionKey>,
     /// When true, non-admin API routes reject requests with 503 (drain mode).
@@ -848,6 +852,9 @@ async fn main() {
     let feature_flag_store = feature_flags::FeatureFlagStore::from_env();
     tracing::info!("Feature flags initialised");
 
+    // Initialize chain cache
+    let chain_cache = Arc::new(chain_cache::ChainCache::new());
+
     // Connect to database if DATABASE_URL is provided
     let db_pool = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         match db::connect(&database_url).await {
@@ -999,6 +1006,7 @@ async fn main() {
         db_pool,
         instance_id,
         plugin_loader,
+        chain_cache,
         enc_key,
         maintenance_mode: Arc::new(AtomicBool::new(false)),
         mpc_client,
@@ -1493,6 +1501,7 @@ async fn main() {
         .route(
             "/api/admin/vk-rollout/promote",
             post(api::admin_rollout_promote),
+        )
         .route(
             "/api/admin/anti-dumping/reports",
             get(api::admin_anti_dumping_reports),
@@ -1699,6 +1708,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
     let active_mpc_sessions = state.metrics.active_mpc_sessions.load(Ordering::SeqCst);
     let request_metrics = state.metrics.route_metrics.lock().await.clone();
+    let chain_cache_stats = state.chain_cache.stats().await;
     let maintenance_mode = state.maintenance_mode.load(Ordering::Relaxed);
     let draining = state.drain.is_draining();
 
@@ -1717,6 +1727,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         contract_deployment,
         active_mpc_sessions,
         request_metrics,
+        chain_cache: chain_cache_stats,
         maintenance_mode,
         draining,
     })
