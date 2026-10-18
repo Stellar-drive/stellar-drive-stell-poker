@@ -2,13 +2,13 @@
 // Uses Poseidon2 permutation over BN254.
 
 // Poseidon2 hash: message_length must equal array length
-fn poseidon2_hash_2(a: Field, b: Field) -> Field {
+pub fn poseidon2_hash_2(a: Field, b: Field) -> Field {
     // For Noir 1.0.0-beta, poseidon2_permutation requires array len == message_length
     // Using a 4-element state with all 4 as message
     std::hash::poseidon2_permutation([a, b, 0, 0], 4)[0]
 }
 
-fn poseidon2_hash_3(a: Field, b: Field, c: Field) -> Field {
+pub fn poseidon2_hash_3(a: Field, b: Field, c: Field) -> Field {
     std::hash::poseidon2_permutation([a, b, c, 0], 4)[0]
 }
 
@@ -20,6 +20,28 @@ pub fn commit_card(card: Field, salt: Field) -> Field {
 // Commit to a player's hand (2 hole cards): H(commit1, commit2)
 pub fn commit_hand(card1_commit: Field, card2_commit: Field) -> Field {
     poseidon2_hash_2(card1_commit, card2_commit)
+}
+
+// Blinded commitment to a 2-hole-card range proof (Issue #211):
+// H(card1, card2, blinding). Blinds the exact cards so the commitment is
+// zero-knowledge and binds the range claim to a single indistinguishable hand.
+pub fn commit_range_hand(card1: Field, card2: Field, blinding: Field) -> Field {
+    poseidon2_hash_3(card1, card2, blinding)
+}
+
+// Commit to an Omaha player's hand (4 hole-card commitments):
+// H(H(c1_commit, c2_commit), H(c3_commit, c4_commit)).
+// Structured so the 4 hole cards are faithfully bound into a single commitment
+// that the showdown circuit can verify against the dealt cards.
+pub fn commit_hand_omaha(
+    c1_commit: Field,
+    c2_commit: Field,
+    c3_commit: Field,
+    c4_commit: Field,
+) -> Field {
+    let h12 = commit_hand(c1_commit, c2_commit);
+    let h34 = commit_hand(c3_commit, c4_commit);
+    commit_hand(h12, h34)
 }
 
 // Commit to 3 board cards
@@ -60,4 +82,21 @@ fn test_hand_commitment() {
 
     let hand2 = commit_hand(c1_commit, c2_commit);
     assert(hand == hand2);
+}
+
+#[test]
+fn test_hand_commitment_omaha() {
+    let c1 = commit_card(10, 111);
+    let c2 = commit_card(25, 222);
+    let c3 = commit_card(39, 333);
+    let c4 = commit_card(44, 444);
+    let hand = commit_hand_omaha(c1, c2, c3, c4);
+
+    let hand2 = commit_hand_omaha(c1, c2, c3, c4);
+    assert(hand == hand2);
+
+    // Different 4th card must change the commitment.
+    let c4b = commit_card(45, 445);
+    let hand3 = commit_hand_omaha(c1, c2, c3, c4b);
+    assert(hand != hand3);
 }

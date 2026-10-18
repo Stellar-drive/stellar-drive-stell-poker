@@ -1,9 +1,71 @@
 use soroban_sdk::{Env, Vec};
 
+use crate::constant_time;
 use crate::types::*;
 
 /// Maximum allowed rake, in basis points (5%). Enforced at table creation.
 pub const MAX_RAKE_BPS: u32 = 500;
+pub const DEFAULT_VARIANCE_THRESHOLD_BPS: u32 = 2_500;
+pub const DEFAULT_VARIANCE_JACKPOT_SHARE_BPS: u32 = 1_000;
+
+/// Default minimum hand category for bad-beat qualification (7 = FourOfAKind).
+#[allow(dead_code)]
+pub const BAD_BEAT_DEFAULT_MIN_CATEGORY: u32 = 7;
+/// Default minimum rank for bad-beat qualification (12 = Ace).
+#[allow(dead_code)]
+pub const BAD_BEAT_DEFAULT_MIN_RANK: u32 = 12;
+
+/// Compute the minimum hand score that qualifies for a bad-beat jackpot payout.
+/// A hand qualifies if its category >= `category` and, when equal, its
+/// quad/trip rank >= `rank`.  This is encoded as:
+///   `score = (category << 28) | (rank << 4)`
+/// which matches the tiebreaker layout used by `HandRank` in `stellar-zk-cards`.
+pub fn min_bad_beat_qualifying_score(category: u32, rank: u32) -> u32 {
+    (category << 28) | (rank << 4)
+}
+
+/// `amount * bps / 10_000`, rounded towards zero, without the intermediate
+/// `amount * bps` product that overflows `i128` for pots above `i128::MAX / bps`.
+///
+/// Splitting `amount = q * 10_000 + r` gives `q * bps + r * bps / 10_000`, which
+/// is exactly the naive result. Both terms are bounded by `amount` for any
+/// `bps <= 10_000`, so nothing can overflow.
+pub(crate) fn mul_bps(amount: i128, bps: u32) -> i128 {
+    let bps = bps as i128;
+    (amount / 10_000) * bps + (amount % 10_000) * bps / 10_000
+}
+
+/// Split `total_rake` into the house share and the jackpot share according to
+/// `jackpot_share_bps` (basis points of the rake).  When jackpot is disabled
+/// (`jackpot_share_bps == 0`), the entire rake goes to the house.
+pub fn split_jackpot_rake(total_rake: i128, jackpot_share_bps: u32) -> (i128, i128) {
+    if jackpot_share_bps == 0 {
+        return (total_rake, 0);
+    }
+    let jackpot = mul_bps(total_rake, jackpot_share_bps);
+    let house = total_rake - jackpot;
+    (house, jackpot)
+}
+
+/// Calculate distribution variance in basis points. A perfectly even winner
+/// distribution is zero; a single seat winning every hand approaches 10,000.
+pub fn outcome_variance_bps(stats: &VarianceStats, player_count: u32) -> u32 {
+    if stats.hands == 0 || player_count < 2 {
+        return 0;
+    }
+
+    let hands = stats.hands as i128;
+    let players = player_count as i128;
+    let mut squared_deviation = 0i128;
+    for seat in 0..player_count {
+        let count = stats.winner_counts.get(seat).unwrap_or(0) as i128;
+        let deviation = count * players - hands;
+        squared_deviation += deviation * deviation;
+    }
+
+    let denominator = hands * hands * players;
+    ((squared_deviation * 10_000) / denominator) as u32
+}
 
 /// Deduct rake from each pot before distribution. Rake is computed per pot as
 /// `floor(pot.amount * rake_bps / 10_000)`, so the fee is predictable and
@@ -22,7 +84,7 @@ pub fn apply_rake(
 
     for i in 0..pots.len() {
         let pot = pots.get(i).ok_or(PokerTableError::InvalidPlayerIndex)?;
-        let rake = (pot.amount * rake_bps as i128) / 10_000;
+        let rake = mul_bps(pot.amount, rake_bps);
         total_rake += rake;
         net_pots.push_back(SidePot {
             amount: pot.amount - rake,
@@ -117,7 +179,7 @@ fn distinct_all_in_levels(env: &Env, table: &TableState) -> Result<Vec<i128>, Po
 fn insert_sorted_unique(levels: &mut Vec<i128>, value: i128) {
     for j in 0..levels.len() {
         let existing = levels.get(j).unwrap_or(0);
-        if value == existing {
+        if constant_time::i128_eq(value, existing) {
             return; // already present
         }
         if value < existing {
@@ -333,7 +395,11 @@ fn eligible_tied_winners(env: &Env, tied: &Vec<u32>, eligible: &Vec<u32>) -> Vec
     for ei in 0..eligible.len() {
         if let Some(seat) = eligible.get(ei) {
             for ti in 0..tied.len() {
-                if tied.get(ti) == Some(seat) {
+                if tied
+                    .get(ti)
+                    .map(|candidate| constant_time::u32_eq(candidate, seat))
+                    .unwrap_or(false)
+                {
                     recipients.push_back(seat);
                     break;
                 }
@@ -364,7 +430,11 @@ fn best_eligible_winner(ranked: &Vec<u32>, eligible: &Vec<u32>) -> Option<u32> {
     for ri in 0..ranked.len() {
         let seat = ranked.get(ri)?;
         for ei in 0..eligible.len() {
-            if eligible.get(ei) == Some(seat) {
+            if eligible
+                .get(ei)
+                .map(|candidate| constant_time::u32_eq(candidate, seat))
+                .unwrap_or(false)
+            {
                 return Some(seat);
             }
         }
@@ -372,12 +442,65 @@ fn best_eligible_winner(ranked: &Vec<u32>, eligible: &Vec<u32>) -> Option<u32> {
     None
 }
 
+/// Split a pot 50/50 between the best high hand and the best qualifying low
+/// hand. The low hand qualifies if it is 8-or-better (the traditional Omaha
+/// Hi-Lo / Stud Hi-Lo rule): no card in the low hand may rank above 8 (where
+/// Ace is high). In a split-pot game each eligible pot is divided evenly between
+/// the high and low winners; odd chips go to the high winner.
+///
+/// `high_ranking` and `low_ranking` are seat-index lists ordered best-first for
+/// their respective evaluations. `low_qualified` flags whether the best low
+/// candidate actually qualifies.
+pub fn distribute_split_pots(
+    env: &Env,
+    table: &mut TableState,
+    pots: &Vec<SidePot>,
+    high_ranking: &Vec<u32>,
+    low_ranking: &Vec<u32>,
+    low_qualified: bool,
+) -> Result<Vec<(u32, i128)>, PokerTableError> {
+    let mut payouts: Vec<(u32, i128)> = Vec::new(env);
+
+    for pi in 0..pots.len() {
+        let pot = pots.get(pi).ok_or(PokerTableError::InvalidPlayerIndex)?;
+        if pot.amount <= 0 {
+            continue;
+        }
+
+        // High winner is always the best eligible from high_ranking.
+        let high_winner = best_eligible_winner(high_ranking, &pot.eligible_players)
+            .ok_or(PokerTableError::WinnerNotEligibleForPot)?;
+
+        if low_qualified {
+            // Low winner is the best eligible from low_ranking.
+            let low_winner = best_eligible_winner(low_ranking, &pot.eligible_players)
+                .ok_or(PokerTableError::WinnerNotEligibleForPot)?;
+
+            let half = pot.amount / 2;
+            let remainder = pot.amount - half;
+
+            if high_winner == low_winner {
+                // Same player wins both halves — entire pot goes to them.
+                credit_player(table, &mut payouts, high_winner, pot.amount)?;
+            } else {
+                credit_player(table, &mut payouts, high_winner, remainder)?;
+                credit_player(table, &mut payouts, low_winner, half)?;
+            }
+        } else {
+            // Low does not qualify — high takes the whole pot.
+            credit_player(table, &mut payouts, high_winner, pot.amount)?;
+        }
+    }
+
+    Ok(payouts)
+}
+
 /// Add `amount` to the running total for `seat`, merging into an existing entry
 /// when a seat wins more than one pot.
 fn accumulate_payout(payouts: &mut Vec<(u32, i128)>, seat: u32, amount: i128) {
     for i in 0..payouts.len() {
         if let Some((s, existing)) = payouts.get(i) {
-            if s == seat {
+            if constant_time::u32_eq(s, seat) {
                 payouts.set(i, (seat, existing + amount));
                 return;
             }
@@ -402,6 +525,8 @@ mod pot_test {
             all_in,
             sitting_out: false,
             seat_index: seat,
+            total_buy_in: 0,
+            rebuy_count: 0,
         }
     }
 
@@ -419,8 +544,8 @@ mod pot_test {
                 token: Address::generate(env),
                 min_buy_in: 0,
                 max_buy_in: i128::MAX,
-                small_blind: 0,
-                big_blind: 0,
+                betting_structure: crate::types::BettingStructure::NoLimit,
+                blinds_schedule: BlindsSchedule::fixed(env, 0, 0),
                 min_players: 2,
                 max_players: 9,
                 timeout_ledgers: 0,
@@ -428,6 +553,14 @@ mod pot_test {
                 verifier: admin.clone(),
                 game_hub: admin.clone(),
                 rake_bps: 0,
+                max_rebuys: 0,
+                jackpot_rake_share_bps: 0,
+                min_bad_beat_category: 7,
+                min_bad_beat_rank: 12,
+                street_time_limit: OptionalStreetTimeLimit::None,
+                treasury: None,
+                dead_chip_timeout_ledgers: 0,
+                reclaim_period_ledgers: 0,
             },
             phase: GamePhase::Showdown,
             players,
@@ -444,6 +577,15 @@ mod pot_test {
             committee: admin,
             session_id: 0,
             rake_balance: 0,
+            action_deadline: 0,
+            hand_actions: Vec::new(env),
+            rit_state: OptionalRitState::None,
+            jackpot_balance: 0,
+            last_raise_size: 0,
+            current_blind_level: 0,
+            level_started_at: 0,
+            break_ends_at: 0,
+            settlement_entered_ledger: 0,
         }
     }
 

@@ -12,9 +12,19 @@ pub fn process_timeout(
     _claimer: &Address,
 ) -> Result<(), PokerTableError> {
     let current_ledger = env.ledger().sequence();
+    // Contract-level timeout check that respects time-bank extensions:
+    // if the current player has an active deadline extension, we check that instead.
+    if table.action_deadline != 0 && current_ledger < table.action_deadline {
+        return Err(PokerTableError::TimeoutNotReached);
+    }
+    // If time-bank could still rescue the player, allow a grace window of 1 ledger
+    // for them to call `use_time_bank` before we enforce the fold.
+    if !crate::time_bank::should_enforce_timeout(env, table) {
+        return Err(PokerTableError::TimeoutNotReached);
+    }
     let elapsed = current_ledger - table.last_action_ledger;
 
-    if elapsed < table.config.timeout_ledgers {
+    if elapsed < table.config.timeout_ledgers && table.action_deadline == 0 {
         return Err(PokerTableError::TimeoutNotReached);
     }
 
@@ -59,6 +69,21 @@ pub fn process_timeout(
             }
         }
 
+        // RIT decision timeout — default to normal play (no RIT)
+        GamePhase::AwaitingRunItTwice => {
+            // Transition to the next normal phase as if RIT was declined
+            table.phase = match table.board_cards.len() {
+                0 => GamePhase::DealingFlop,
+                3 => GamePhase::DealingTurn,
+                4 => GamePhase::DealingRiver,
+                _ => GamePhase::Showdown,
+            };
+            table.last_action_ledger = current_ledger;
+            table.action_deadline = 0;
+            env.events()
+                .publish((Symbol::new(env, "rit_timeout"), table.id), ());
+        }
+
         // Committee timeout during dealing/reveal — dispute, return funds
         GamePhase::Dealing
         | GamePhase::DealingFlop
@@ -88,9 +113,108 @@ pub fn process_timeout(
     Ok(())
 }
 
+/// Force-fold a stalling player after the action deadline has passed.
+///
+/// Any seated player (except the one whose turn it is) may call this once
+/// the on-chain `action_deadline` ledger has been reached. The target player
+/// is folded, the turn advances, and the deadline is reset for the new
+/// active player.
+pub fn force_fold(
+    env: &Env,
+    table: &mut TableState,
+    caller: &Address,
+    target_seat: u32,
+) -> Result<(), PokerTableError> {
+    let current_ledger = env.ledger().sequence();
+
+    // Must be in a betting phase
+    if !matches!(
+        table.phase,
+        GamePhase::Preflop | GamePhase::Flop | GamePhase::Turn | GamePhase::River
+    ) {
+        return Err(PokerTableError::ForceFoldNotAvailable);
+    }
+
+    // Deadline must have passed
+    if table.action_deadline == 0 || current_ledger < table.action_deadline {
+        return Err(PokerTableError::TimeoutNotReached);
+    }
+
+    // The target must be the current player to act
+    if target_seat != table.current_turn {
+        return Err(PokerTableError::TargetNotActive);
+    }
+
+    // Verify caller is a seated player (not the target)
+    let caller_seat = find_seat_by_address(env, table, caller)?;
+    if caller_seat == target_seat {
+        return Err(PokerTableError::NotYourTurn);
+    }
+
+    // Target must be active (not folded, not all-in)
+    let mut target = table
+        .players
+        .get(target_seat)
+        .ok_or(PokerTableError::InvalidPlayerIndex)?;
+    if target.folded || target.all_in {
+        return Err(PokerTableError::TargetNotActive);
+    }
+
+    // Force fold the target
+    target.folded = true;
+    table.players.set(target_seat, target.clone());
+
+    env.events().publish(
+        (Symbol::new(env, "force_fold"), table.id),
+        (target.address.clone(), caller.clone()),
+    );
+
+    // Check if only one player remains
+    if game::active_player_count(table) == 1 {
+        game::settle_fold_win(env, table)?;
+    } else {
+        // Advance to next player
+        let num_players = table.players.len() as u32;
+        let mut next = (target_seat + 1) % num_players;
+        for _ in 0..num_players {
+            let np = table
+                .players
+                .get(next)
+                .ok_or(PokerTableError::InvalidPlayerIndex)?;
+            if !np.folded && !np.all_in {
+                break;
+            }
+            next = (next + 1) % num_players;
+        }
+        table.current_turn = next;
+        table.last_action_ledger = current_ledger;
+        table.action_deadline = current_ledger + table.config.timeout_ledgers;
+    }
+
+    Ok(())
+}
+
+/// Find the seat index of a player by their address.
+fn find_seat_by_address(
+    _env: &Env,
+    table: &TableState,
+    address: &Address,
+) -> Result<u32, PokerTableError> {
+    for i in 0..table.players.len() {
+        let p = table
+            .players
+            .get(i)
+            .ok_or(PokerTableError::InvalidPlayerIndex)?;
+        if crate::constant_time::address_eq(_env, &p.address, address) {
+            return Ok(p.seat_index);
+        }
+    }
+    Err(PokerTableError::PlayerNotAtTable)
+}
+
 /// Emergency refund: return all player stacks + pot split equally
 /// among non-folded players. Used when committee fails.
-fn emergency_refund(_env: &Env, table: &mut TableState) -> Result<(), PokerTableError> {
+fn emergency_refund(env: &Env, table: &mut TableState) -> Result<(), PokerTableError> {
     let active = game::active_player_count(table);
     if active == 0 {
         return Ok(());
@@ -129,5 +253,6 @@ fn emergency_refund(_env: &Env, table: &mut TableState) -> Result<(), PokerTable
 
     table.pot = 0;
     table.phase = GamePhase::Settlement;
+    table.settlement_entered_ledger = env.ledger().sequence();
     Ok(())
 }

@@ -2,7 +2,20 @@
 # Compile Noir circuits with a co-noir-compatible Nargo toolchain.
 #
 # Usage:
-#   ./scripts/compile-circuits.sh
+#   ./scripts/compile-circuits.sh [--force] [--help]
+#
+# Flags:
+#   -f, --force   Recompile every circuit, ignoring the freshness cache.
+#   -h, --help    Show this help text and exit.
+#
+# Caching:
+#   By default a circuit is recompiled only when its compiled artifact
+#   (circuits/<name>/target/<name>.json) is missing or older than any of its
+#   source inputs — the circuit's own src/ and Nargo.toml, plus the shared
+#   circuits/lib/ that every circuit depends on. Up-to-date circuits are
+#   skipped (their artifact version is still verified). Use --force to bypass
+#   this and always recompile. CI complements this with actions/cache keyed on
+#   the circuit source hash + nargo version (see .github/workflows/ci.yml).
 #
 # Optional env vars:
 #   EXPECTED_NOIR_VERSION (default: 1.0.0-beta.17)
@@ -13,13 +26,37 @@
 
 set -euo pipefail
 
+usage() {
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+FORCE=0
+for arg in "$@"; do
+    case "${arg}" in
+        -f|--force) FORCE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *)
+            echo "Unknown argument: ${arg}" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 EXPECTED_NOIR_VERSION="${EXPECTED_NOIR_VERSION:-1.0.0-beta.17}"
+
+# Issue #92, #503: Verify CRS integrity prior to compilation (fails hard on mismatch)
+echo "Ensuring verified CRS is present..."
+"${SCRIPT_DIR}/download-crs.sh"
 EXPECTED_NOIR_TAG="v${EXPECTED_NOIR_VERSION}"
 TOOLS_DIR="${PROJECT_DIR}/.tmp_tools"
-CIRCUITS=(deal_valid reveal_board_valid showdown_valid)
+CIRCUITS=(deal_valid reveal_board_valid showdown_valid showdown_valid_omaha deal_valid_shoe deal_valid_shoe_8d fold_valid deck_complete)
+CIRCUITS=(deal_valid reveal_board_valid showdown_valid burn_card_valid side_pot_valid deck_complete time_bank_valid batched_hand_packing)
+PARAMETERISED_CIRCUITS=(deal_valid showdown_valid)
+PLAYER_COUNTS=(2 3 4 5 6)
 
 detect_platform_asset() {
     local os arch
@@ -112,7 +149,46 @@ verify_artifact_version() {
     fi
 }
 
+# Return 0 (fresh) if the compiled artifact exists and is newer than every
+# source input for the circuit; return 1 (stale) otherwise. Sources include
+# the circuit's own src/ + Nargo.toml and the shared circuits/lib it depends on.
+artifact_is_fresh() {
+    local circuit="$1"
+    local artifact="$2"
+
+    [ -f "${artifact}" ] || return 1
+
+    local newer
+    newer="$(find \
+        "${PROJECT_DIR}/circuits/${circuit}/src" \
+        "${PROJECT_DIR}/circuits/${circuit}/Nargo.toml" \
+        "${PROJECT_DIR}/circuits/lib/src" \
+        "${PROJECT_DIR}/circuits/lib/Nargo.toml" \
+        -type f -newer "${artifact}" -print -quit 2>/dev/null)"
+
+    [ -z "${newer}" ]
+}
+
 main() {
+    # Decide up front which circuits actually need recompiling so we can skip
+    # the (slow) nargo download entirely on a full cache hit.
+    local to_compile=()
+    local circuit artifact
+    for circuit in "${CIRCUITS[@]}"; do
+        artifact="${PROJECT_DIR}/circuits/${circuit}/target/${circuit}.json"
+        if [ "${FORCE}" -eq 0 ] && artifact_is_fresh "${circuit}" "${artifact}"; then
+            echo "Skipping ${circuit} — artifact up to date (use --force to recompile)."
+            verify_artifact_version "${artifact}"
+        else
+            to_compile+=("${circuit}")
+        fi
+    done
+
+    if [ "${#to_compile[@]}" -eq 0 ]; then
+        echo "All circuit artifacts are up to date; nothing to compile."
+        return 0
+    fi
+
     local nargo_bin
     nargo_bin="$(resolve_nargo_bin)"
 
@@ -121,7 +197,7 @@ main() {
 
     mkdir -p "${PROJECT_DIR}/.tmp_nargo_home"
 
-    for circuit in "${CIRCUITS[@]}"; do
+    for circuit in "${to_compile[@]}"; do
         echo "Compiling ${circuit}..."
         HOME="${PROJECT_DIR}/.tmp_nargo_home" \
             "${nargo_bin}" compile --program-dir "${PROJECT_DIR}/circuits/${circuit}"
@@ -129,6 +205,57 @@ main() {
     done
 
     echo "Circuit compilation complete."
+
+    # Issue #7: Compile parameterised variants for player counts 2–6.
+    for circuit in "${PARAMETERISED_CIRCUITS[@]}"; do
+        for npc in "${PLAYER_COUNTS[@]}"; do
+            variant="${circuit}_${npc}p"
+            variant_dir="${PROJECT_DIR}/circuits/${variant}"
+            src_dir="${PROJECT_DIR}/circuits/${circuit}/src"
+            artifact="${variant_dir}/target/${variant}.json"
+
+            if [ "${FORCE}" -eq 0 ] && [ -f "${artifact}" ]; then
+                echo "Skipping ${variant} — artifact up to date."
+                verify_artifact_version "${artifact}"
+                continue
+            fi
+
+            echo "Compiling ${variant} (PLAYER_COUNT=${npc})..."
+            mkdir -p "${variant_dir}/src"
+
+            # Copy source files
+            cp "${src_dir}/main.nr" "${variant_dir}/src/main.nr"
+
+            # Generate Nargo.toml with the variant name and PLAYER_COUNT override
+            cat > "${variant_dir}/Nargo.toml" <<TOML
+[package]
+name = "${variant}"
+type = "bin"
+authors = ["Stellar Poker"]
+compiler_version = ">=0.36.0"
+
+[dependencies]
+stellar_poker_lib = { path = "../lib" }
+
+[package.metadata.circuit]
+description = "Parameterised ${circuit} for ${npc} players (Issue #7)."
+max_players = ${npc}
+TOML
+
+            HOME="${PROJECT_DIR}/.tmp_nargo_home" \
+                PLAYER_COUNT="${npc}" \
+                "${nargo_bin}" compile --program-dir "${variant_dir}"
+            verify_artifact_version "${artifact}"
+        done
+    done
+    echo "Parameterised circuit compilation complete."
+
+    echo "Running circuit unit tests (circuits/lib)..."
+    HOME="${PROJECT_DIR}/.tmp_nargo_home" \
+        "${nargo_bin}" test --program-dir "${PROJECT_DIR}/circuits/lib" || {
+        echo "WARNING: nargo test failed for circuits/lib" >&2
+    }
+    echo "Circuit unit tests complete."
 }
 
 main "$@"

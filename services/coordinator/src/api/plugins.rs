@@ -4,10 +4,8 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::plugin::PluginLoader;
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -240,8 +238,8 @@ pub async fn call_plugin_function(
 
     let result = match req.function.as_str() {
         "evaluate_hand" => {
-            let cards: [u32; 7] = serde_json::from_value(req.args)
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            let cards: [u32; 7] =
+                serde_json::from_value(req.args).map_err(|_| StatusCode::BAD_REQUEST)?;
             let rank = loader
                 .call_evaluate_hand(&name, &cards)
                 .await
@@ -269,7 +267,10 @@ pub async fn call_plugin_function(
         }
         "get_blind_structure" => {
             let args: serde_json::Value = req.args;
-            let small_blind = args.get("small_blind").and_then(|v| v.as_i64()).unwrap_or(10) as i128;
+            let small_blind = args
+                .get("small_blind")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(10) as i128;
             let big_blind = args.get("big_blind").and_then(|v| v.as_i64()).unwrap_or(20) as i128;
             let level = args.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let structure = loader

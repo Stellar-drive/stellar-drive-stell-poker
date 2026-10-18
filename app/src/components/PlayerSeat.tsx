@@ -1,10 +1,19 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Card } from "./Card";
 import { PixelCat, opponentSprite } from "./PixelCat";
-import { PixelChip } from "./PixelChip";
+import { PixelChip, AnimatedChipCounter } from "./PixelChip";
 import { Identicon } from "./Identicon";
+import { Avatar } from "./Avatar";
+import { AvatarSelector } from "./AvatarSelector";
+import { StackSparkline } from "./StackSparkline";
+import { PixelCountdownRing } from "./PixelCountdownRing";
 import type { Player } from "@/lib/game-state";
+import { classifyHandStrength } from "@/lib/hand-strength";
+import type { HandStrength } from "@/lib/hand-strength";
+import { getPlayerHudStats, type PlayerHudStats } from "@/lib/api";
+import { useT } from "@/lib/i18n/context";
 
 interface PlayerSeatProps {
   player: Player;
@@ -18,10 +27,37 @@ interface PlayerSeatProps {
   alias?: string;
   /** Renders a small edit affordance next to the label (own seat only). */
   onEditAlias?: () => void;
+  /** Fired when the user clicks their own avatar to open the customizer (Issue #153). */
+  onEditAvatar?: () => void;
   hideChipStats?: boolean;
   activeEmote?: string | null;
+  /** Board cards needed for hand strength evaluation. */
+  boardCards?: number[];
+  /** Current game phase to determine when to show hand strength. */
+  gamePhase?: string;
+  /** Disable HUD stats tooltip (e.g. storybook / bots). */
+  showStatsTooltip?: boolean;
+  /** Stack sizes over recent hands, oldest first, for the trend sparkline (#157). */
+  stackTrend?: number[];
+  /** Countdown seconds remaining (0 = hide timer visual). #154 */
+  turnTimerSecondsLeft?: number;
+  /** Total turn-timer duration in seconds. #154 */
+  turnTimerDurationSeconds?: number;
+  /** If true, pulse red near expiration. #154 */
+  turnTimerUrgent?: boolean;
 }
 
+function formatPct(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  return `${Math.round(n * 10) / 10}%`;
+}
+
+function formatAf(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  return (Math.round(n * 100) / 100).toFixed(2);
+}
+
+/** Renders Player Seat */
 export function PlayerSeat({
   player,
   isCurrentTurn,
@@ -32,22 +68,58 @@ export function PlayerSeat({
   labelOverride,
   alias,
   onEditAlias,
+  onEditAvatar,
   hideChipStats = false,
   activeEmote = null,
+  boardCards = [],
+  gamePhase = "",
+  showStatsTooltip = true,
+  stackTrend,
+  turnTimerSecondsLeft,
+  turnTimerDurationSeconds,
+  turnTimerUrgent,
 }: PlayerSeatProps) {
+  const [showAvatarPicker, setShowAvatarPicker] = useState(false);
+  const t = useT();
+  const [hud, setHud] = useState<PlayerHudStats | null>(null);
+  const [hudLoaded, setHudLoaded] = useState(false);
+
+  useEffect(() => {
+    if (!showStatsTooltip || isBot || !player.address) return;
+    let cancelled = false;
+    getPlayerHudStats(player.address)
+      .then((stats) => {
+        if (!cancelled) {
+          setHud(stats);
+          setHudLoaded(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setHudLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [player.address, showStatsTooltip, isBot]);
+
   const sprite = isUser ? 18 : opponentSprite(player.seat);
   const cardSize = isUser ? "md" : "sm";
   const fallbackLabel = isUser
-    ? "— YOU —"
+    ? t("seat.you")
     : isBot
-      ? "— AI BOT —"
+      ? t("seat.aiBot")
       : `${player.address.slice(0, 4)}...${player.address.slice(-4)}`;
   const displayLabel =
     labelOverride ?? (alias ? (isUser ? `${alias} (YOU)` : alias) : fallbackLabel);
 
+  const showStrength = isUser && player.cards && boardCards.length >= 3 && ["flop", "turn", "river"].includes(gamePhase);
+  const handStrength: HandStrength | null = showStrength
+    ? classifyHandStrength(player.cards!, boardCards)
+    : null;
+
   return (
     <div
-      className="relative flex flex-col items-center gap-1"
+      className={`relative flex flex-col items-center gap-1${showStatsTooltip && !isBot ? " has-stats-tooltip" : ""}`}
       style={{
         opacity: player.folded ? 0.5 : 1,
         // Pulse glow on user's own seat when it's their turn (#47).
@@ -63,6 +135,36 @@ export function PlayerSeat({
         transition: "box-shadow 0.3s",
       }}
     >
+      {showStatsTooltip && !isBot && (
+        <div className="stats-tooltip" role="tooltip">
+          {!hudLoaded && (
+            <div style={{ color: "#7f8c8d" }}>{t("stats.loadingStats")}</div>
+          )}
+          {hudLoaded && hud && (
+            <>
+              <div className="stats-tooltip-row">
+                <span className="stats-tooltip-label">{t("stats.vpip")}</span>
+                <span className="stats-tooltip-value">{formatPct(hud.vpip)}</span>
+              </div>
+              <div className="stats-tooltip-row">
+                <span className="stats-tooltip-label">{t("stats.pfr")}</span>
+                <span className="stats-tooltip-value">{formatPct(hud.pfr)}</span>
+              </div>
+              <div className="stats-tooltip-row">
+                <span className="stats-tooltip-label">{t("stats.aggression")}</span>
+                <span className="stats-tooltip-value">{formatAf(hud.aggression_factor)}</span>
+              </div>
+              <div className="stats-tooltip-row">
+                <span className="stats-tooltip-label">{t("stats.hands")}</span>
+                <span className="stats-tooltip-value">{hud.hands_played}</span>
+              </div>
+            </>
+          )}
+          {hudLoaded && !hud && (
+            <div style={{ color: "#7f8c8d" }}>—</div>
+          )}
+        </div>
+      )}
       {activeEmote && (
         <div
           className="absolute z-50 bg-[#1a120c] border-2 border-[#8b6914] px-2 py-1 text-[16px] animate-float-up pointer-events-none text-center"
@@ -81,17 +183,33 @@ export function PlayerSeat({
           />
         </div>
       )}
-      {/* Turn indicator */}
+      {/* Turn indicator + countdown ring (Issue #154) */}
       {isCurrentTurn && !player.folded && (
-        <div style={{
-          animation: 'textPulse 1s ease-in-out infinite',
-          fontSize: '9px',
-          color: '#f1c40f',
-          textShadow: '1px 1px 0 rgba(0,0,0,0.6)',
-          whiteSpace: 'nowrap',
-          marginBottom: '2px',
-        }}>
-          {isUser ? "▼ YOUR TURN ▼" : "▼ THEIR TURN ▼"}
+        <div
+          className="flex items-center gap-2"
+          style={{
+            marginBottom: '2px',
+          }}
+        >
+          {typeof turnTimerSecondsLeft === "number" && turnTimerSecondsLeft > 0 &&
+           typeof turnTimerDurationSeconds === "number" && turnTimerDurationSeconds > 0 && (
+            <PixelCountdownRing
+              size={22}
+              durationSeconds={turnTimerDurationSeconds}
+              timeLeftSeconds={turnTimerSecondsLeft}
+              urgent={!!turnTimerUrgent}
+              label=""
+            />
+          )}
+          <div style={{
+            animation: 'textPulse 1s ease-in-out infinite',
+            fontSize: '9px',
+            color: '#f1c40f',
+            textShadow: '1px 1px 0 rgba(0,0,0,0.6)',
+            whiteSpace: 'nowrap',
+          }}>
+            {isUser ? t("seat.yourTurn") : t("seat.theirTurn")}
+          </div>
         </div>
       )}
 
@@ -103,7 +221,7 @@ export function PlayerSeat({
           textShadow: "1px 1px 0 rgba(0,0,0,0.6)",
           marginBottom: '2px',
         }}>
-          ★ WINNER ★
+          {t("seat.winner")}
         </div>
       )}
 
@@ -113,11 +231,12 @@ export function PlayerSeat({
         textShadow: '1px 1px 0 rgba(0,0,0,0.5)',
       }}>
         <span>{displayLabel}</span>
-        {isDealer && <span style={{ color: '#f1c40f' }}>[D]</span>}
+        {!hideChipStats && stackTrend && <StackSparkline values={stackTrend} />}
+        {isDealer && <span style={{ color: '#f1c40f' }}>{t("seat.dealer")}</span>}
         {onEditAlias && (
           <button
             onClick={onEditAlias}
-            title="Change your alias"
+            title={t("seat.editAlias")}
             style={{
               background: 'none',
               border: 'none',
@@ -127,12 +246,12 @@ export function PlayerSeat({
               padding: 0,
             }}
           >
-            [EDIT]
+            {t("seat.edit")}
           </button>
         )}
       </div>
 
-      {/* Avatar */}
+      {/* Avatar — Issue #153: on-chain SVG / NFT profile pics with Identicon fallback */}
       <div style={{ marginBottom: '4px', position: 'relative' }}>
         {isBot ? (
           <img
@@ -144,27 +263,63 @@ export function PlayerSeat({
           />
         ) : (
           <>
-            <PixelCat
-              sprite={sprite}
-              size={isUser ? 72 : 48}
-              isUser={isUser}
-            />
-            {/* Deterministic identicon badge — a stable visual fingerprint of
-                the seat's Stellar address, independent of the cat sprite
-                (which is assigned by seat index, not identity). */}
-            <div style={{ position: 'absolute', bottom: '-2px', right: '-2px' }}>
-              <Identicon seed={player.address} size={5} cellSize={3} />
+            <div
+              onClick={
+                isUser
+                  ? () => {
+                      if (onEditAvatar) {
+                        onEditAvatar();
+                      } else {
+                        setShowAvatarPicker(true);
+                      }
+                    }
+                  : undefined
+              }
+              title={isUser ? t("seat.editAvatar") ?? "Click to customize avatar" : undefined}
+            >
+              <Avatar
+                address={player.address}
+                size={isUser ? 56 : 40}
+                pixelated={true}
+                showIdenticonBadge={true}
+              />
+            </div>
+            {/* Legacy PixelCat is shown behind the custom avatar for the
+                seat-position visual marker — keeps the "your seat" glow and
+                opponent sprite cycling intact. */}
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                zIndex: -1,
+                opacity: isUser ? 0.15 : 0,
+                pointerEvents: 'none',
+              }}
+              aria-hidden="true"
+            >
+              <PixelCat
+                sprite={sprite}
+                size={isUser ? 56 : 40}
+                isUser={isUser}
+              />
             </div>
           </>
         )}
       </div>
+      {/* Inline avatar picker modal (local to this seat) */}
+      {showAvatarPicker && (
+        <AvatarSelector
+          onClose={() => setShowAvatarPicker(false)}
+          onUpdated={() => setShowAvatarPicker(false)}
+        />
+      )}
 
       {/* Cards */}
       <div className="flex gap-1">
         {player.cards ? (
           <>
-            <Card value={player.cards[0]} size={cardSize} faceDown={!isUser} />
-            <Card value={player.cards[1]} size={cardSize} faceDown={!isUser} />
+            <Card value={player.cards[0]} size={cardSize} faceDown={!isUser} flip={isUser} dealFrom={{ x: -10, y: -60 }} strength={handStrength} />
+            <Card value={player.cards[1]} size={cardSize} faceDown={!isUser} flip={isUser} flipDelay={0.08} dealFrom={{ x: 10, y: -60 }} strength={handStrength} />
           </>
         ) : (
           <>
@@ -183,7 +338,7 @@ export function PlayerSeat({
               color: '#27ae60',
               textShadow: '1px 1px 0 rgba(0,0,0,0.4)',
             }}>
-              {player.stack.toLocaleString()} CHIPS
+              <AnimatedChipCounter value={player.stack} suffix={` ${t("seat.chips")}`} />
             </span>
           </div>
 
@@ -197,7 +352,7 @@ export function PlayerSeat({
             >
               <PixelChip color="gold" size={1} />
               <span className="text-[9px]" style={{ color: '#f1c40f' }}>
-                BET: {player.betThisRound.toLocaleString()}
+                {t("seat.bet")}: <AnimatedChipCounter value={player.betThisRound} />
               </span>
             </div>
           )}
@@ -206,14 +361,14 @@ export function PlayerSeat({
 
       {/* Status tags */}
       {player.folded && (
-        <div className="text-[9px]" style={{ color: '#e74c3c' }}>FOLDED</div>
+        <div className="text-[9px]" style={{ color: '#e74c3c' }}>{t("seat.folded")}</div>
       )}
       {player.allIn && (
         <div className="text-[9px]" style={{
           color: '#e67e22',
           animation: 'textPulse 0.8s ease-in-out infinite',
         }}>
-          ALL IN!
+          {t("seat.allIn")}
         </div>
       )}
     </div>

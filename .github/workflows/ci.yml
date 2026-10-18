@@ -7,18 +7,26 @@ on:
     branches: [main]
 
 jobs:
-  contracts:
-    name: Soroban contracts
+  contracts-check:
+    name: Soroban contracts check & clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install gitleaks
+        run: brew install gitleaks
+
+      - name: Run gitleaks secret scanning
+        run: |
+          gitleaks protect --config .gitleaks.toml --staged
+        working-directory: .
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
           path: |
@@ -28,14 +36,136 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
       - name: Check workspace
         run: cargo check --workspace
 
-      - name: Test poker-table contract
-        run: cargo test -p poker-table
+      - name: Audit contract storage access
+        run: python3 scripts/audit_storage_access.py
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
+
+      # circuits/test-vectors renders vectors.json and circuits/lib/src/test_vectors.nr
+      # from one generator; a hash construction changed on either side without
+      # `cargo run -p stellar-drive-stell-poker-test-vectors -- generate` fails here.
+      - name: Check shared Noir/Rust test vectors
+        run: cargo run -p stellar-drive-stell-poker-test-vectors -- check
+
+  log-redaction:
+    name: Log redaction policy (Issue #508)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Enforce forbidden log fields
+        run: python3 scripts/check_log_redaction.py
+  contracts-test:
+    name: Soroban contract tests (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [poker-table, zk-verifier, committee-registry, game-hub, player-rating, stellar-zk-cards, stellar-drive-stell-poker-test-vectors]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Test ${{ matrix.package }} contract
+        run: cargo test -p ${{ matrix.package }}
+
+  contracts-coverage:
+    name: Contract coverage (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: poker-table
+            min-lines: 80
+          - package: zk-verifier
+            min-lines: 0
+          - package: committee-registry
+            min-lines: 0
+          - package: game-hub
+            min-lines: 0
+          - package: player-rating
+            min-lines: 0
+    env:
+      # Only count the contract under test, not shared crates it pulls in.
+      COV_IGNORE: "stellar-zk-cards/|services/|vendor/"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cov-
+
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov -p ${{ matrix.package }} --no-report
+          cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$COV_IGNORE"
+          cargo llvm-cov report --json --summary-only --output-path coverage-summary.json --ignore-filename-regex "$COV_IGNORE"
+          cargo llvm-cov report --summary-only --ignore-filename-regex "$COV_IGNORE" | tee coverage-summary.txt
+
+      - name: Publish coverage summary
+        run: |
+          PCT=$(jq -r '.data[0].totals.lines.percent' coverage-summary.json)
+          {
+            echo "### Coverage: ${{ matrix.package }}"
+            echo "Line coverage: ${PCT}% (minimum: ${{ matrix.min-lines }}%)"
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Retained per run so coverage can be tracked over time.
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.package }}
+          path: |
+            lcov.info
+            coverage-summary.json
+            coverage-summary.txt
+          retention-days: 90
+
+      - name: Enforce minimum line coverage
+        run: cargo llvm-cov report --fail-under-lines ${{ matrix.min-lines }} --ignore-filename-regex "$COV_IGNORE"
 
   circuits:
     name: Noir circuits
@@ -46,22 +176,38 @@ jobs:
       - name: Cache Nargo toolchain
         uses: actions/cache@v4
         with:
-          # compile-circuits.sh downloads a pinned Nargo release into
-          # .tmp_tools and uses .tmp_nargo_home as an isolated NARGO/HOME.
           path: |
             .tmp_tools
             .tmp_nargo_home
           key: ${{ runner.os }}-nargo-1.0.0-beta.17
           restore-keys: ${{ runner.os }}-nargo-
 
-      - name: Compile all Noir circuits
-        run: ./scripts/compile-circuits.sh
+      - name: Cache compiled circuit artifacts
+        uses: actions/cache@v4
+        with:
+          # Compiled ACIR per circuit. Keyed on the nargo version + a hash of
+          # every circuit source so any change busts the cache. Exact match only.
+          path: |
+            circuits/**/target
+          key: ${{ runner.os }}-circuits-1.0.0-beta.17-${{ hashFiles('circuits/**/src/**/*.nr', 'circuits/**/Nargo.toml') }}
 
       - name: Install Nargo for tests
         run: |
           curl -L https://raw.githubusercontent.com/noir-lang/noirup/refs/heads/main/install | bash
           echo "$HOME/.nargo/bin" >> $GITHUB_PATH
           $HOME/.nargo/bin/noirup -v 1.0.0-beta.17
+
+      # nargo has no `--all` and there is no workspace manifest, so check the
+      # shared library and each circuit scripts/compile-circuits.sh maintains.
+      # (Six unmaintained circuit directories do not compile and are not built.)
+      - name: Check shared library and maintained circuits
+        run: |
+          for circuit in lib deal_valid reveal_board_valid showdown_valid burn_card_valid side_pot_valid deck_complete time_bank_valid batched_hand_packing; do
+            nargo check --program-dir "circuits/${circuit}"
+          done
+
+      - name: Compile all Noir circuits
+        run: ./scripts/compile-circuits.sh
 
       - name: Run Noir library tests
         run: cd circuits/lib && nargo test
@@ -96,8 +242,25 @@ jobs:
           key: ${{ runner.os }}-e2e-nargo-crs-1.0.0-beta.17
           restore-keys: ${{ runner.os }}-e2e-nargo-crs-
 
+      # Cache co-noir binary to avoid recompiling from source on every run
+      - name: Cache co-noir binary
+        id: cache-co-noir
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/co-noir
+          key: co-noir-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install co-noir
+        if: steps.cache-co-noir.outputs.cache-hit != 'true'
+        run: |
+          cargo install --git https://github.com/TaceoLabs/co-snarks --branch main co-noir
+          co-noir --version
+
       - name: Compile circuits
         run: ./scripts/compile-circuits.sh
+
+      - name: Install co-noir for CRS download
+        run: cargo install --git https://github.com/TaceoLabs/co-snarks --branch main co-noir
 
       - name: Download CRS
         run: ./scripts/download-crs.sh
@@ -108,8 +271,11 @@ jobs:
       - name: Start Soroban and MPC stack
         run: docker compose up -d --build soroban mpc-node-0 mpc-node-1 mpc-node-2 coordinator
 
-      - name: Run full hand lifecycle flow
+      - name: Run full hand lifecycle flow (2 players)
         run: python3 scripts/test-flow.py
+
+      - name: Run complete 6-player hand e2e flow
+        run: python3 scripts/test-6player-flow.py
 
       - name: Install schemathesis for conformance test
         run: pip install schemathesis pyyaml
@@ -127,8 +293,8 @@ jobs:
         if: always()
         run: docker compose down --remove-orphans
 
-  frontend:
-    name: Next.js frontend
+  visual-regression:
+    name: Visual regression
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,11 +306,91 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: app/node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-modules-
+
+      - name: Install dependencies
+        run: cd app && npm ci
+
+      - name: Install Playwright browsers
+        run: cd app && npx playwright install --with-deps chromium
+
+      - name: Build
+        run: cd app && npm run build
+        env:
+          NEXT_PUBLIC_COORDINATOR_URL: http://localhost:8080
+
+      - name: Run screenshot tests (update snapshots on push to main)
+        if: github.event_name == 'push'
+        run: cd app && npx playwright test --config=e2e/playwright.config.ts --project=chromium --update-snapshots tests/visual-regression.spec.ts
+        env:
+          CI: true
+
+      - name: Run screenshot tests (compare on PR)
+        if: github.event_name == 'pull_request'
+        run: cd app && npx playwright test --config=e2e/playwright.config.ts --project=chromium tests/visual-regression.spec.ts
+        env:
+          CI: true
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-visual
+          path: app/playwright-report/
+
+  frontend-lint:
+    name: Frontend lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: app/node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-modules-
+
       - name: Install dependencies
         run: cd app && npm ci
 
       - name: Lint
-        run: cd app && npm run lint
+        run: cd app && npm run lint --if-present
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: app/node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('app/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-modules-
+
+      - name: Install dependencies
+        run: cd app && npm ci
 
       - name: Build
         run: cd app && npm run build

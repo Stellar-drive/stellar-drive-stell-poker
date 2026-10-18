@@ -21,41 +21,91 @@ use axum::{
     middleware,
     middleware::Next,
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use prometheus::{
-    Encoder, Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts,
+    Registry, TextEncoder,
 };
-use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use sysinfo::{get_current_pid, ProcessesToUpdate, System};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{RwLock, Mutex};
 use tower_http::cors::CorsLayer;
+use sysinfo::{get_current_pid, ProcessesToUpdate, System};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
+mod anti_dumping;
 mod api;
+mod api_keys;
+mod api_version;
+mod archiver;
 mod audit_log;
 mod chain_cache;
+mod bandwidth;
+mod chat;
+mod circuit_pins;
+mod committee_scaling;
 mod cors_db;
+pub mod crypto;
+mod dashboard;
 mod db;
+mod discovery;
+mod drain;
+mod errors;
 mod feature_flags;
+mod hot_reload;
+mod idempotency;
+mod job_queue;
+mod key_rotation;
+mod leader_election;
 mod mpc;
+mod mpc_auth_middleware;
+mod mpc_benchmark;
+mod mpc_heartbeat;
+mod mpc_identity;
+mod mpc_node_benchmark;
+mod mpc_partition;
+mod mpc_validation;
+mod mpc_version;
+mod node_attestation;
+mod node_decommission;
+mod node_reliability;
 mod plugin;
+mod proof_cache;
+mod rate_limit;
 mod rate_limit_db;
+mod redact;
 #[path = "middleware.rs"]
 mod request_log;
+mod session_cache;
 mod session_gc;
+mod session_isolation;
 mod session_migration;
+mod session_preemption;
+mod session_recovery;
 mod soroban;
+mod spectators;
+mod submission_ledger;
 mod stats;
+mod telemetry;
+mod tls_client;
+mod vk_rollout;
+
+/// Re-exported so downstream modules can refer to `crate::MpcNodeProgress`.
+pub use api::types::MpcNodeProgress;
+mod tournament;
+mod transcript_log;
 
 use api::admin::{AdminConfig, AdminState};
+use api::MpcNodeProgress;
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, utoipa::ToSchema)]
 pub struct LatencyHistogram {
     pub under_50ms: u64,
     pub under_250ms: u64,
@@ -76,19 +126,137 @@ impl Default for LatencyHistogram {
     }
 }
 
-#[derive(Serialize, Clone, Debug, Default)]
+#[derive(Serialize, Clone, Debug, Default, utoipa::ToSchema)]
 pub struct RouteMetric {
     pub count: u64,
     pub errors: u64,
     pub latency_histogram: LatencyHistogram,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, utoipa::ToSchema)]
 pub struct MpcNodeHealth {
     pub endpoint: String,
     pub connected: bool,
-    pub last_heartbeat: Option<SystemTime>,
+    pub last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when the node advertises drain mode for planned maintenance (#571).
+    #[serde(default)]
+    pub draining: bool,
 }
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct SorobanHealth {
+    pub endpoint: String,
+    pub status: String,
+}
+
+/// Deployment status of the Soroban poker_table contract. `configured` is true
+/// when the coordinator has both a contract id and a non-default signer; the
+/// `contract_id` is exposed (possibly empty) so the dashboard can render it
+/// and a developer can verify on-chain.
+#[derive(Serialize, utoipa::ToSchema)]
+struct ContractDeployment {
+    pub configured: bool,
+    pub contract_id: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct HealthResponse {
+    pub uptime_seconds: u64,
+    pub mpc_nodes: Vec<MpcNodeHealth>,
+    pub soroban_rpc: SorobanHealth,
+    pub contract_deployment: ContractDeployment,
+    pub active_mpc_sessions: usize,
+    pub request_metrics: HashMap<String, RouteMetric>,
+    /// True while the operator has put the coordinator into maintenance mode.
+    pub maintenance_mode: bool,
+    /// True while the coordinator is draining for a blue-green cutover.
+    pub draining: bool,
+    /// Chain-state cache hit/miss statistics.
+    #[schema(value_type = Object)]
+    pub chain_cache: chain_cache::CacheStats,
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        health,
+        get_stats,
+        api::get_chain_config,
+        api::create_table,
+        api::rit_opt_in,
+        api::transfer_chips,
+        api::flags::list_flags,
+        api::flags::set_flag,
+    ),
+    components(schemas(
+        LatencyHistogram,
+        RouteMetric,
+        MpcNodeHealth,
+        SorobanHealth,
+        ContractDeployment,
+        HealthResponse,
+        stats::GlobalStats,
+        stats::PlayerStats,
+        stats::StatsResponse,
+        api::types::SetFlagBody,
+        api::types::DealRequest,
+        api::types::DealResponse,
+        api::types::RevealResponse,
+        api::types::ShowdownResponse,
+        api::types::PlayerActionRequest,
+        api::types::PlayerActionResponse,
+        api::types::TableStateResponse,
+        api::types::PlayerCardsResponse,
+        api::types::CommitteeStatusResponse,
+        api::types::RegisterNodeRequest,
+        api::types::NodeRegistryResponse,
+        api::types::ChainConfigResponse,
+        api::types::CreateTableRequest,
+        api::types::CreateTableResponse,
+        api::types::OpenTablesResponse,
+        api::types::OpenTableInfo,
+        api::types::TableOverviewResponse,
+        api::types::TableOverviewInfo,
+        stats::PlayerHudStats,
+        stats::RatingEntry,
+        stats::RatingLeaderboardResponse,
+        api::types::JoinTableResponse,
+        api::types::TableLobbyResponse,
+        api::types::LobbySeat,
+        api::types::WalletChallengeRequest,
+        api::types::WalletChallengeResponse,
+        api::types::WalletVerifyRequest,
+        api::types::WalletVerifyResponse,
+        api::types::RitOptInRequest,
+        api::types::RitOptInResponse,
+        api::types::TransferChipsRequest,
+        api::types::TransferChipsResponse,
+        api::types::MpcNodeProgress,
+        api::types::TableMpcStatusResponse,
+        crate::errors::ErrorBody,
+    )),
+    tags(
+        (name = "Health", description = "Health check and monitoring endpoints"),
+        (name = "Chain", description = "Stellar chain configuration"),
+        (name = "Tables", description = "Poker table lifecycle and game actions"),
+        (name = "MPC Committee", description = "MPC node committee status"),
+        (name = "Flags", description = "Runtime feature flags"),
+        (name = "Sessions", description = "MPC session management"),
+        (name = "Wallet Auth", description = "Wallet-based authentication"),
+        (name = "Admin", description = "Admin operations (requires RBAC)"),
+        (name = "Metrics", description = "Prometheus metrics"),
+    ),
+    info(
+        title = "stellar-drive-stell-poker Coordinator API",
+        version = "0.1.0",
+        description = "REST API for the stellar-drive-stell-poker MPC coordinator service."
+    ),
+    servers(
+        (url = "https://coordinator.stellar-drive-stell-poker.example.com", description = "Production coordinator"),
+        (url = "http://localhost:8080", description = "Local development")
+    )
+)]
+struct ApiDoc;
 
 #[derive(Clone)]
 pub struct PrometheusMetrics {
@@ -98,6 +266,242 @@ pub struct PrometheusMetrics {
     pub request_latency: HistogramVec,
     pub process_cpu_percent: Gauge,
     pub process_memory_bytes: Gauge,
+    /// 1 when the node reports draining, 0 otherwise (label: endpoint).
+    pub node_draining: GaugeVec,
+    /// CSP violation reports accepted by `POST /api/csp/report` (issue #136).
+    pub csp_reports_total: IntCounter,
+    /// CSP reports rejected by ingestion validation, labelled by reason
+    /// (`too_large` | `malformed` | `no_violation`) (issue #136).
+    pub csp_reports_rejected_total: IntCounterVec,
+    /// CSP violations by sanitized `effective_directive` and `disposition`
+    /// labels (issue #136).
+    pub csp_violations_total: IntCounterVec,
+    pub mpc_session_success_total: IntCounter,
+    pub mpc_session_errors_total: IntCounter,
+    pub mpc_session_refusals_total: IntCounter,
+    pub mpc_prove_duration_seconds: HistogramVec,
+    /// MPC session duration by phase handler (Issue #604): deal, reveal, showdown.
+    pub mpc_phase_duration_seconds: HistogramVec,
+    pub memory_watermark_bytes: Gauge,
+}
+
+impl PrometheusMetrics {
+    /// Build the full metric family, registering every instrument on a
+    /// dedicated registry.
+    fn new() -> Self {
+        let registry = Arc::new(Registry::new());
+        let request_counter = IntCounterVec::new(
+            Opts::new("coordinator_requests_total", "Total coordinator requests."),
+            &["method", "route"],
+        )
+        .unwrap();
+        let request_errors = IntCounterVec::new(
+            Opts::new(
+                "coordinator_request_errors_total",
+                "Total coordinator request errors.",
+            ),
+            &["method", "route"],
+        )
+        .unwrap();
+        let request_latency = HistogramVec::new(
+            HistogramOpts::new(
+                "coordinator_request_latency_seconds",
+                "Request latency histogram in seconds.",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["method", "route"],
+        )
+        .unwrap();
+        let process_cpu_percent = Gauge::with_opts(Opts::new(
+            "coordinator_process_cpu_percent",
+            "Coordinator process CPU usage percentage.",
+        ))
+        .unwrap();
+        let process_memory_bytes = Gauge::with_opts(Opts::new(
+            "coordinator_process_memory_bytes",
+            "Coordinator process memory usage in bytes.",
+        ))
+        .unwrap();
+        let node_draining = GaugeVec::new(
+            Opts::new(
+                "coordinator_mpc_node_draining",
+                "1 when the MPC node advertises drain mode, 0 otherwise.",
+            ),
+            &["endpoint"],
+        )
+        .unwrap();
+        let csp_reports_total = IntCounter::new(
+            "coordinator_csp_reports_total",
+            "Total CSP violation reports ingested.",
+        )
+        .unwrap();
+        let csp_reports_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "coordinator_csp_reports_rejected_total",
+                "CSP reports rejected by ingestion validation.",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+        let csp_violations_total = IntCounterVec::new(
+            Opts::new(
+                "coordinator_csp_violations_total",
+                "CSP violations by effective directive and disposition.",
+            ),
+            &["effective_directive", "disposition"],
+        )
+        .unwrap();
+        let mpc_session_success_total = IntCounter::new(
+            "coordinator_mpc_session_success_total",
+            "MPC proof sessions completed successfully.",
+        )
+        .unwrap();
+        let mpc_session_errors_total = IntCounter::new(
+            "coordinator_mpc_session_errors_total",
+            "MPC proof sessions that ended with an error.",
+        )
+        .unwrap();
+        let mpc_session_refusals_total = IntCounter::new(
+            "coordinator_mpc_session_refusals_total",
+            "New MPC sessions refused at the memory watermark.",
+        )
+        .unwrap();
+        let mpc_prove_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "coordinator_mpc_prove_duration_seconds",
+                "MPC proof duration by committee node.",
+            )
+            .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0]),
+            &["node_id"],
+        )
+        .unwrap();
+        let memory_watermark_bytes = Gauge::with_opts(Opts::new(
+            "coordinator_memory_watermark_bytes",
+            "Configured process memory watermark for new MPC sessions.",
+        ))
+        .unwrap();
+        let mpc_phase_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "coordinator_mpc_phase_duration_seconds",
+                "MPC session duration by phase handler (deal, reveal, showdown).",
+            )
+            .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0]),
+            &["phase"],
+        )
+        .unwrap();
+
+        registry
+            .register(Box::new(request_counter.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(request_errors.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(request_latency.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(process_cpu_percent.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(process_memory_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(node_draining.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(csp_reports_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(csp_reports_rejected_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(csp_violations_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_session_success_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_session_errors_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_session_refusals_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_prove_duration_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(memory_watermark_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(mpc_phase_duration_seconds.clone()))
+            .unwrap();
+
+        Self {
+            registry,
+            request_counter,
+            request_errors,
+            request_latency,
+            process_cpu_percent,
+            process_memory_bytes,
+            node_draining,
+            csp_reports_total,
+            csp_reports_rejected_total,
+            csp_violations_total,
+            mpc_session_success_total,
+            mpc_session_errors_total,
+            mpc_session_refusals_total,
+            mpc_prove_duration_seconds,
+            mpc_phase_duration_seconds,
+            memory_watermark_bytes,
+        }
+    }
+}
+
+pub(crate) fn memory_watermark_bytes() -> u64 {
+    std::env::var("COORDINATOR_MEMORY_WATERMARK_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn try_admit_mpc_session(metrics: &PrometheusMetrics) -> bool {
+    let watermark = metrics.memory_watermark_bytes.get() as u64;
+    let current = metrics.process_memory_bytes.get() as u64;
+    if watermark > 0 && current >= watermark {
+        metrics.mpc_session_refusals_total.inc();
+        tracing::warn!(current_bytes = current, watermark_bytes = watermark,
+            "refusing new MPC session at memory watermark");
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+mod memory_admission_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_new_session_at_watermark() {
+        let metrics = PrometheusMetrics::new();
+        metrics.memory_watermark_bytes.set(100.0);
+        metrics.process_memory_bytes.set(100.0);
+
+        assert!(!try_admit_mpc_session(&metrics));
+        assert_eq!(metrics.mpc_session_refusals_total.get(), 1);
+    }
+
+    #[test]
+    fn admits_new_session_below_watermark() {
+        let metrics = PrometheusMetrics::new();
+        metrics.memory_watermark_bytes.set(100.0);
+        metrics.process_memory_bytes.set(99.0);
+
+        assert!(try_admit_mpc_session(&metrics));
+        assert_eq!(metrics.mpc_session_refusals_total.get(), 0);
+    }
 }
 
 #[derive(Clone)]
@@ -119,8 +523,17 @@ struct AppState {
     admin_config: Arc<RwLock<api::admin::AdminConfig>>,
     admin_state: api::admin::AdminState,
     rate_limit_state: Arc<RwLock<RateLimitState>>,
+    /// Per-IP sliding-window buckets for the global rate-limit middleware (Issue #25).
+    ip_buckets: rate_limit::IpBucketStore,
+    /// Counter of 429 responses; watched by the sustained-rate alert task (Issue #25).
+    rejection_counter: rate_limit::RejectionCounter,
     metrics: MetricsState,
     chat_channels: Arc<Mutex<HashMap<u32, tokio::sync::broadcast::Sender<String>>>>,
+    /// Per-table broadcast channels for `/api/table/:table_id/state/ws`
+    /// (Issue #105 — real-time game state push).
+    game_state_channels: Arc<Mutex<HashMap<u32, tokio::sync::broadcast::Sender<String>>>>,
+    /// Live anonymous spectator counts per table (Issue #171).
+    spectators: spectators::SpectatorRegistry,
     mpc_sessions: session_gc::SessionStore,
     stats: stats::StatsStore,
     feature_flags: feature_flags::FeatureFlagStore,
@@ -128,6 +541,80 @@ struct AppState {
     instance_id: String,
     pub plugin_loader: Arc<tokio::sync::RwLock<plugin::PluginLoader>>,
     chain_cache: Arc<chain_cache::ChainCache>,
+    /// Shared key ring for encrypting sensitive in-memory fields.
+    enc_key: Arc<crypto::EncryptionKey>,
+    /// When true, non-admin API routes reject requests with 503 (drain mode).
+    pub maintenance_mode: Arc<AtomicBool>,
+    /// Shared HTTP client used for all coordinator → MPC node calls.
+    mpc_client: reqwest::Client,
+    /// Whether this coordinator instance currently holds the leader lock.
+    leader_state: leader_election::LeaderState,
+    /// In-memory registry of dynamically discovered MPC nodes (used when
+    /// static `MPC_NODE_*` endpoints and the committee registry are unset).
+    node_registry: Arc<RwLock<discovery::NodeRegistry>>,
+    /// Idempotency key cache for mutation endpoints (Issue #106).
+    idempotency_store: idempotency::IdempotencyStore,
+    /// MPC deal phase benchmarks (Issue #100).
+    benchmark_store: mpc_benchmark::BenchmarkStore,
+    /// Rotating committee-registry identity used for node registration /
+    /// staking (Issue #102). Kept separate from `soroban_config.secret_key`
+    /// (the general transaction-submission identity) so rotating it can't
+    /// disrupt in-flight gameplay transaction signing.
+    committee_key_rotation: Arc<RwLock<key_rotation::KeyRotationState>>,
+    /// Single-use registry for MPC proof session IDs (Issue #12).
+    /// A session ID that has already been used is rejected to prevent replay
+    /// attacks on deal/reveal/showdown proofs.
+    used_session_ids: Arc<RwLock<HashSet<String>>>,
+    /// Archived MPC sessions (Issue #259) served by the admin archive endpoints.
+    archive_store: archiver::ArchiveStore,
+    /// Archive retention/purge policy.
+    archive_config: archiver::ArchiveConfig,
+    /// Blue-green drain state (Issue #340).
+    drain: drain::DrainState,
+    /// Verification-key / circuit rollout policy.
+    vk_rollout: vk_rollout::RolloutState,
+    /// At-most-once Soroban proof submission ledger (Issue #592).
+    /// Prevents duplicate on-chain submissions on coordinator retries.
+    submission_ledger: submission_ledger::SubmissionLedgerStore,
+    /// Anti-chip-dumping detector fed with settled hand outcomes (Issue #504).
+    /// Kept as `Arc<Mutex<_>>` because it is mutated from showdown handlers and
+    /// read by the admin report endpoint.
+    anti_dumping: Arc<std::sync::Mutex<anti_dumping::DumpingDetector>>,
+    /// Multi-tenant isolation denial audit (Issue #509). Records every
+    /// cross-session read/write/subscribe attempt that was denied so operators
+    /// can prove sessions A and B cannot observe each other.
+    isolation_audit: Arc<std::sync::Mutex<session_isolation::IsolationAudit>>,
+    /// Async job queue for MPC session orchestration.
+    /// Replaces synchronous in-request MPC handling with retry, priority,
+    /// cancellation, and progress tracking.
+    pub job_queue: Arc<job_queue::JobQueue>,
+    /// Per-node protocol/circuit version handshake registry (Issue #233).
+    version_registry: mpc_version::VersionRegistry,
+    /// Per-node resource/throughput benchmark samples (Issue #234).
+    node_benchmark_store: mpc_node_benchmark::NodeBenchmarkStore,
+    /// Consensus-based network partition detector for the MPC cluster (Issue #236).
+    partition_store: mpc_partition::PartitionStore,
+    /// Committee registry mapping MPC node id -> trusted Stellar address,
+    /// used to verify node identity and signed session messages (Issue #237).
+    committee_registry: mpc_identity::CommitteeRegistry,
+    /// Replay protection tracker for MPC session messages (Issue #500).
+    mpc_nonce_tracker: mpc_identity::SessionNonceTracker,
+    /// In-memory sit-and-go tournament state.
+    tournaments: tournament::TournamentStore,
+    /// Session archive index and retention config (restore/purge admin endpoints).
+    archive_store: archiver::ArchiveStore,
+    archive_config: archiver::ArchiveConfig,
+    /// Validated CSP violation reports for frontend `report-uri` /
+    /// `report-to` ingestion (Issue #136).
+    csp_reports: api::csp::CspReportStore,
+    /// Signed build attestations per MPC node (Issue #587).
+    attestation_store: node_attestation::AttestationStore,
+    /// Attestation policy: strict mode + accepted binary hashes (Issue #587).
+    attestation_config: node_attestation::AttestationConfig,
+    /// Committee node decommission / reshuffle state machine (Issue #585).
+    decommission: Arc<RwLock<node_decommission::DecommissionManager>>,
+    /// MPC session preemption policy controller (Issue #588).
+    preemption: Arc<RwLock<session_preemption::PreemptionController>>,
 }
 
 #[derive(Clone)]
@@ -135,15 +622,21 @@ struct AppState {
 struct MpcConfig {
     /// Endpoints of the 3 MPC nodes
     node_endpoints: Vec<String>,
+    /// Whether `node_endpoints` came from explicitly-set `MPC_NODE_*` env vars
+    /// (vs. built-in localhost defaults). When true, dynamic node discovery is
+    /// disabled and these static endpoints are used (backward compatibility).
+    static_endpoints_configured: bool,
+    /// Opt-in deterministic table-to-committee affinity for larger committees.
+    table_affinity_enabled: bool,
     /// Path to compiled Noir circuits (ACIR)
     circuit_dir: String,
     /// Soroban RPC endpoint
     soroban_rpc: String,
-    /// Committee signing key (for submitting txns)
-    committee_secret: String,
+    /// Committee signing key encrypted with the process encryption key.
+    committee_secret: crypto::EncryptedField,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct TableSession {
     table_id: u32,
@@ -171,14 +664,32 @@ struct TableSession {
     reveal_session_ids: HashMap<String, String>,
     /// Revealed cards by phase.
     revealed_cards_by_phase: HashMap<String, Vec<u32>>,
+    /// Selected MPC node endpoints for this table.
+    selected_node_endpoints: Vec<String>,
     /// Latest showdown tx hash, if submitted.
     showdown_tx_hash: Option<String>,
     /// Last showdown proof session ID, if submitted.
     showdown_session_id: Option<String>,
     /// Cached showdown result for idempotent retries.
     showdown_result: Option<(String, u32)>,
+    /// Run-It-Twice tracking: "inactive" or "run2_active".
+    rit_phase: String,
+    /// Number of shared board cards when RIT was activated (0=preflop, 3=flop, 4=turn).
+    /// Set once from on-chain state during Run 1 showdown; used for Run 2 board computation.
+    #[serde(default)]
+    rit_shared_board_count: u32,
     /// Monotonic nonce for unique proof session IDs.
     proof_nonce: u64,
+    /// Per-node MPC phase progress for the current operation.
+    #[serde(default)]
+    mpc_node_progress: Vec<MpcNodeProgress>,
+    /// Timestamp when the current MPC operation started (epoch secs).
+    #[serde(default)]
+    mpc_operation_started: Option<u64>,
+    /// Circuit artifact hashes pinned at session start (circuit_name → sha256_hex).
+    /// Every proof submission verifies these to prevent mid-session artifact changes.
+    #[serde(default)]
+    pinned_artifact_hashes: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -193,26 +704,64 @@ struct RateLimitState {
 
 #[tokio::main]
 async fn main() {
-    // Structured logging: REQUEST_LOG_FORMAT=json uses JSON output; default is human-readable.
+    // Structured logging: REQUEST_LOG_FORMAT=json uses JSON output; default is
+    // human-readable. Every line passes through the redaction writer (Issue
+    // #509) so card values, MPC shares and commitment salts are stripped from
+    // either format before they reach the sink.
     let log_format = std::env::var("REQUEST_LOG_FORMAT").unwrap_or_default();
     if log_format.eq_ignore_ascii_case("json") {
-        tracing_subscriber::fmt().json().init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(redact::RedactingMakeWriter::new(std::io::stdout))
+            .init();
     } else {
-        tracing_subscriber::fmt().init();
+        tracing_subscriber::fmt()
+            .with_writer(redact::RedactingMakeWriter::new(std::io::stdout))
+            .init();
     }
+    // Initialise tracing + optional OpenTelemetry OTLP pipeline.
+    // The guard must stay alive for the duration of the process — dropping it
+    // flushes all pending spans to the exporter.
+    let _otel_guard = telemetry::init_tracer();
 
+    let enc_key =
+        crypto::EncryptionKey::from_env().unwrap_or_else(|_| crypto::EncryptionKey::ephemeral());
+    let enc_key = Arc::new(enc_key);
+
+    let committee_secret_plaintext =
+        std::env::var("COMMITTEE_SECRET").unwrap_or_else(|_| "test_secret".to_string());
+    let committee_secret = crypto::EncryptedField::encrypt(&enc_key, &committee_secret_plaintext)
+        .expect("failed to encrypt committee_secret");
+
+    // If any MPC_NODE_* env var is explicitly set, treat the endpoints as
+    // statically configured and disable dynamic discovery (backward compat).
+    let static_endpoints_configured =
+        (0..3).any(|i| std::env::var(format!("MPC_NODE_{}", i)).is_ok());
     let mpc_config = MpcConfig {
         node_endpoints: vec![
             std::env::var("MPC_NODE_0").unwrap_or_else(|_| "http://localhost:8101".to_string()),
             std::env::var("MPC_NODE_1").unwrap_or_else(|_| "http://localhost:8102".to_string()),
             std::env::var("MPC_NODE_2").unwrap_or_else(|_| "http://localhost:8103".to_string()),
         ],
+        static_endpoints_configured,
+        table_affinity_enabled: std::env::var("MPC_TABLE_AFFINITY_ENABLED")
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false),
         circuit_dir: std::env::var("CIRCUIT_DIR").unwrap_or_else(|_| "./circuits".to_string()),
         soroban_rpc: std::env::var("SOROBAN_RPC")
             .unwrap_or_else(|_| "http://localhost:8000/soroban/rpc".to_string()),
-        committee_secret: std::env::var("COMMITTEE_SECRET")
-            .unwrap_or_else(|_| "test_secret".to_string()),
+        committee_secret,
     };
+
+    // Build the shared MPC HTTP client (with optional mTLS / certificate pinning).
+    let mpc_client = match mpc::build_mpc_client() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to build MPC HTTP client: {}", e);
+            std::process::exit(1);
+        }
+    };
+    tracing::info!("MPC HTTP client initialised");
 
     let soroban_config = soroban::SorobanConfig::from_env();
     if soroban_config.is_configured() {
@@ -231,75 +780,21 @@ async fn main() {
             endpoint: ep.clone(),
             connected: false,
             last_heartbeat: None,
+            draining: false,
         })
         .collect::<Vec<_>>();
-
-    let prometheus_registry = Arc::new(Registry::new());
-    let request_counter = IntCounterVec::new(
-        Opts::new("coordinator_requests_total", "Total coordinator requests."),
-        &["method", "route"],
-    )
-    .unwrap();
-    let request_errors = IntCounterVec::new(
-        Opts::new(
-            "coordinator_request_errors_total",
-            "Total coordinator request errors.",
-        ),
-        &["method", "route"],
-    )
-    .unwrap();
-    let request_latency = HistogramVec::new(
-        HistogramOpts::new(
-            "coordinator_request_latency_seconds",
-            "Request latency histogram in seconds.",
-        )
-        .buckets(vec![
-            0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-        ]),
-        &["method", "route"],
-    )
-    .unwrap();
-    let process_cpu_percent = Gauge::with_opts(Opts::new(
-        "coordinator_process_cpu_percent",
-        "Coordinator process CPU usage percentage.",
-    ))
-    .unwrap();
-    let process_memory_bytes = Gauge::with_opts(Opts::new(
-        "coordinator_process_memory_bytes",
-        "Coordinator process memory usage in bytes.",
-    ))
-    .unwrap();
-
-    prometheus_registry
-        .register(Box::new(request_counter.clone()))
-        .unwrap();
-    prometheus_registry
-        .register(Box::new(request_errors.clone()))
-        .unwrap();
-    prometheus_registry
-        .register(Box::new(request_latency.clone()))
-        .unwrap();
-    prometheus_registry
-        .register(Box::new(process_cpu_percent.clone()))
-        .unwrap();
-    prometheus_registry
-        .register(Box::new(process_memory_bytes.clone()))
-        .unwrap();
 
     let metrics = MetricsState {
         boot_time: Instant::now(),
         active_mpc_sessions: Arc::new(AtomicUsize::new(0)),
         route_metrics: Arc::new(Mutex::new(HashMap::new())),
         node_healths: Arc::new(Mutex::new(initial_node_healths)),
-        prometheus: PrometheusMetrics {
-            registry: prometheus_registry,
-            request_counter,
-            request_errors,
-            request_latency,
-            process_cpu_percent: process_cpu_percent.clone(),
-            process_memory_bytes: process_memory_bytes.clone(),
-        },
+        prometheus: PrometheusMetrics::new(),
     };
+    metrics
+        .prometheus
+        .memory_watermark_bytes
+        .set(memory_watermark_bytes() as f64);
 
     let system_state = Arc::new(Mutex::new(System::new_all()));
     let mpc_sessions: session_gc::SessionStore =
@@ -334,6 +829,7 @@ async fn main() {
 
     let admin_config = AdminConfig::from_env();
     let admin_state = AdminState::new();
+    let benchmark_store = mpc_benchmark::new_store();
 
     // Spawn the Horizon event indexer if Soroban is configured.
     if soroban_config.is_configured() && !soroban_config.poker_table_contract.is_empty() {
@@ -387,6 +883,18 @@ async fn main() {
     let instance_id = session_migration::generate_instance_id();
     tracing::info!("Coordinator instance ID: {}", instance_id);
 
+    // Leader election: start as follower; acquire advisory lock if DB is
+    // available. Only the leader accepts new game sessions.
+    let leader_state = leader_election::LeaderState::new();
+    if let Some(ref pool) = db_pool {
+        leader_election::spawn(Arc::clone(pool), leader_state.clone());
+        tracing::info!("Leader election started (PostgreSQL advisory lock)");
+    } else {
+        // No database → single-node mode; this instance is always the leader.
+        leader_state.force_leader();
+        tracing::warn!("No database — running in single-node mode (always leader)");
+    }
+
     let mut wasm_config = wasmtime::Config::new();
     wasm_config
         .consume_fuel(true)
@@ -406,17 +914,92 @@ async fn main() {
         }
     }
 
+    let hot_reload_snapshot = hot_reload::snapshot_path_from_env();
+    let restored_snapshot = hot_reload_snapshot
+        .as_ref()
+        .and_then(|path| hot_reload::load_snapshot(path));
+    let tables = Arc::new(RwLock::new(
+        restored_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.tables.clone())
+            .unwrap_or_default(),
+    ));
+    let lobby_assignments = Arc::new(RwLock::new(
+        restored_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.lobby_assignments.clone())
+            .unwrap_or_default(),
+    ));
+    if let Some(snapshot) = &restored_snapshot {
+        tracing::info!(
+            "Restored hot-reload snapshot with {} table session(s)",
+            snapshot.tables.len()
+        );
+    }
+
+    let archive_config = archiver::ArchiveConfig::from_env();
+    let archive_store = archiver::new_store();
+    archiver::load_existing_archives(&archive_store, &archive_config).await;
+
+    // Verification-key / circuit rollout policy: pins a circuit version per
+    // circuit kind and optionally canaries a percentage of tables onto the next
+    // version, with per-version proof metrics and an auto-promote/rollback
+    // switch (config from `VK_ROLLOUT_CONFIG`, default `./vk-rollout.json`).
+    let vk_rollout = vk_rollout::RolloutState::from_env(&metrics.prometheus.registry);
+    let drain_state = drain::DrainState::new();
+
+    // Committee identity rotation (Issue #102): bootstrap from the
+    // already-configured COMMITTEE_SECRET so an existing on-chain
+    // registration is treated as the initial "active" key.
+    let committee_key_rotation = {
+        let now = SystemTime::now();
+        let initial_key = key_rotation::CommitteeKey::from_secret(&soroban_config.secret_key, now)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "COMMITTEE_SECRET is not a valid Stellar key ({e}); generating an ephemeral \
+                     identity for committee key rotation tracking"
+                );
+                key_rotation::CommitteeKey::generate(now)
+            });
+        Arc::new(RwLock::new(key_rotation::KeyRotationState::new(
+            initial_key,
+            key_rotation::RotationConfig::from_env(),
+        )))
+    };
+
+    let version_registry = mpc_version::new_registry();
+    let node_benchmark_store = mpc_node_benchmark::new_store();
+    let partition_store = mpc_partition::new_store(mpc_partition::PartitionConfig::from_env());
+    let committee_registry = mpc_identity::new_registry();
+    // Seed committee identities from the static MPC_NODE_<n>_ADDRESS env vars,
+    // when present, mirroring how MPC_NODE_<n> endpoints are configured.
+    {
+        let mut seeded = Vec::new();
+        for i in 0..8u32 {
+            if let Ok(address) = std::env::var(format!("MPC_NODE_{}_ADDRESS", i)) {
+                seeded.push((i.to_string(), address));
+            }
+        }
+        if !seeded.is_empty() {
+            mpc_identity::seed_registry(&committee_registry, &seeded).await;
+        }
+    }
+
     let state = AppState {
-        tables: Arc::new(RwLock::new(HashMap::new())),
-        lobby_assignments: Arc::new(RwLock::new(HashMap::new())),
+        tables: Arc::clone(&tables),
+        lobby_assignments: Arc::clone(&lobby_assignments),
         mpc_config,
         soroban_config,
         auth_state: Arc::new(RwLock::new(AuthState::default())),
         admin_config: Arc::new(RwLock::new(admin_config)),
         admin_state,
         rate_limit_state: Arc::new(RwLock::new(RateLimitState::default())),
+        ip_buckets: rate_limit::new_ip_bucket_store(),
+        rejection_counter: rate_limit::new_rejection_counter(),
         metrics: metrics.clone(),
         chat_channels: Arc::new(Mutex::new(HashMap::new())),
+        game_state_channels: Arc::new(Mutex::new(HashMap::new())),
+        spectators: spectators::SpectatorRegistry::new(),
         mpc_sessions,
         stats: stats_store,
         feature_flags: feature_flag_store,
@@ -424,42 +1007,350 @@ async fn main() {
         instance_id,
         plugin_loader,
         chain_cache,
+        enc_key,
+        maintenance_mode: Arc::new(AtomicBool::new(false)),
+        mpc_client,
+        leader_state,
+        node_registry: Arc::new(RwLock::new(discovery::NodeRegistry::new())),
+        idempotency_store: idempotency::new_store(),
+        benchmark_store,
+        committee_key_rotation,
+        used_session_ids: Arc::new(RwLock::new(HashSet::new())),
+        archive_store,
+        archive_config,
+        drain: drain_state,
+        vk_rollout,
+        submission_ledger: submission_ledger::new_store(
+            &std::env::var("SUBMISSION_LEDGER_DB_PATH")
+                .unwrap_or_else(|_| "./data/submission_ledger.db".to_string()),
+        ),
+        anti_dumping: Arc::new(std::sync::Mutex::new(
+            anti_dumping::DumpingDetector::with_default_config(),
+        )),
+        isolation_audit: Arc::new(std::sync::Mutex::new(
+            session_isolation::IsolationAudit::default(),
+        )),
+        job_queue: Arc::new(job_queue::JobQueue::new(
+            std::env::var("MPC_JOB_QUEUE_WORKERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4),
+        )),
+        version_registry,
+        node_benchmark_store,
+        partition_store,
+        committee_registry,
+        mpc_nonce_tracker: mpc_identity::SessionNonceTracker::new(),
+        tournaments: tournament::new_store(),
+        archive_store: archive_store.clone(),
+        archive_config: archive_config.clone(),
+        csp_reports: api::csp::CspReportStore::new(),
+        attestation_store: node_attestation::new_store(),
+        attestation_config: node_attestation::AttestationConfig::from_env(),
+        decommission: Arc::new(RwLock::new(
+            node_decommission::DecommissionManager::from_env(),
+        )),
+        preemption: Arc::new(RwLock::new(
+            session_preemption::PreemptionController::from_env(),
+        )),
     };
+    idempotency::spawn_gc_task(state.idempotency_store.clone());
+    rate_limit::spawn_rate_alert_task(state.rejection_counter.clone());
+    rate_limit::spawn_bucket_gc_task(state.ip_buckets.clone());
+    key_rotation::spawn_rotation_task(
+        state.committee_key_rotation.clone(),
+        state.soroban_config.clone(),
+    );
+    // Register job queue handlers.
+    let jq = Arc::clone(&state.job_queue);
+    let mpc_client_jq = state.mpc_client.clone();
+    let mpc_config_jq = state.mpc_config.clone();
+    jq.register_handler(
+        "mpc_deal",
+        Arc::new(move |job| {
+            let client = mpc_client_jq.clone();
+            let cfg = mpc_config_jq.clone();
+            tokio::spawn(async move {
+                let table_id = job.table_id;
+                let players: Vec<String> =
+                    serde_json::from_value(job.payload.get("players").cloned().unwrap_or_default())
+                        .unwrap_or_default();
+                let prepared = mpc::prepare_deal_from_nodes(
+                    &client,
+                    &cfg.node_endpoints,
+                    &cfg.circuit_dir,
+                    table_id,
+                    &players,
+                )
+                .await
+                .map_err(|e| format!("deal prepare failed: {}", e))?;
+                let session_id = job.job_id.replace("job-mpc_deal-", "proof-");
+                let deal_circuit = if players.len() >= 2 && players.len() < 6 {
+                    format!("deal_valid_{}p", players.len())
+                } else {
+                    "deal_valid".to_string()
+                };
+                let proof = mpc::generate_proof_from_share_sets(
+                    &client,
+                    table_id,
+                    &prepared.share_set_ids,
+                    &session_id,
+                    &deal_circuit,
+                    &cfg.circuit_dir,
+                    &cfg.node_endpoints,
+                )
+                .await
+                .map_err(|e| format!("deal proof generation failed: {}", e))?;
+                Ok(serde_json::json!({
+                    "proof": proof.proof,
+                    "public_inputs": proof.public_inputs,
+                    "session_id": proof.session_id,
+                }))
+            })
+        }),
+    );
+    let jq2 = Arc::clone(&state.job_queue);
+    let mpc_client_jq2 = state.mpc_client.clone();
+    let mpc_config_jq2 = state.mpc_config.clone();
+    jq2.register_handler(
+        "mpc_reveal",
+        Arc::new(move |job| {
+            let client = mpc_client_jq2.clone();
+            let cfg = mpc_config_jq2.clone();
+            tokio::spawn(async move {
+                let table_id = job.table_id;
+                let phase: String =
+                    serde_json::from_value(job.payload.get("phase").cloned().unwrap_or_default())
+                        .unwrap_or_default();
+                let dealt_indices: Vec<u32> = serde_json::from_value(
+                    job.payload
+                        .get("dealt_indices")
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+                .unwrap_or_default();
+                let deck_root: String = serde_json::from_value(
+                    job.payload.get("deck_root").cloned().unwrap_or_default(),
+                )
+                .unwrap_or_default();
+                let prepared = mpc::prepare_reveal_from_nodes(
+                    &client,
+                    &cfg.node_endpoints,
+                    &cfg.circuit_dir,
+                    table_id,
+                    &phase,
+                    &dealt_indices,
+                    &deck_root,
+                )
+                .await
+                .map_err(|e| format!("reveal prepare failed: {}", e))?;
+                let session_id = job.job_id.replace("job-mpc_reveal-", "proof-");
+                let proof = mpc::generate_proof_from_share_sets(
+                    &client,
+                    table_id,
+                    &prepared.share_set_ids,
+                    &session_id,
+                    "reveal_board_valid",
+                    &cfg.circuit_dir,
+                    &cfg.node_endpoints,
+                )
+                .await
+                .map_err(|e| format!("reveal proof generation failed: {}", e))?;
+                Ok(serde_json::json!({
+                    "proof": proof.proof,
+                    "public_inputs": proof.public_inputs,
+                    "session_id": proof.session_id,
+                }))
+            })
+        }),
+    );
+    state.job_queue.spawn_workers();
+    circuit_pins::spawn_circuit_watcher(state.mpc_config.circuit_dir.clone());
+
+    if let Some(path) = hot_reload_snapshot {
+        hot_reload::spawn_snapshot_task(path, Arc::clone(&tables), Arc::clone(&lobby_assignments));
+    }
+
+    archiver::spawn_archive_task(
+        state.mpc_sessions.clone(),
+        Arc::clone(&state.tables),
+        state.archive_store.clone(),
+        state.archive_config.clone(),
+    );
 
     // Spawn background node health check task
-    let node_endpoints = state.mpc_config.node_endpoints.clone();
     let node_healths = state.metrics.node_healths.clone();
+    let node_draining_gauge = state.metrics.prometheus.node_draining.clone();
+    let soroban_config = state.soroban_config.clone();
+    let default_endpoints = state.mpc_config.node_endpoints.clone();
+    let hc_client = state.mpc_client.clone();
+    // Issue #587: attestation gates health in strict mode.
+    let attestation_store = state.attestation_store.clone();
+    let attestation_config = state.attestation_config.clone();
+    let committee_registry_hc = state.committee_registry.clone();
     tokio::spawn(async move {
         loop {
-            for (idx, endpoint) in node_endpoints.iter().enumerate() {
+            // Each entry is (node_id, endpoint). Node ids let the strict
+            // attestation check identify who is claiming to be healthy.
+            let nodes: Vec<(String, String)> = if soroban_config
+                .committee_registry_contract
+                .is_empty()
+            {
+                default_endpoints
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ep)| (i.to_string(), ep.clone()))
+                    .collect()
+            } else {
+                match soroban::fetch_active_nodes_from_registry(&soroban_config).await {
+                    Ok(members) => {
+                        let registry = committee_registry_hc.read().await;
+                        members
+                            .into_iter()
+                            .map(|m| {
+                                let node_id = registry
+                                    .iter()
+                                    .find(|(_, addr)| **addr == m.address)
+                                    .map(|(id, _)| id.clone())
+                                    .unwrap_or_default();
+                                (node_id, m.endpoint)
+                            })
+                            .collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to fetch nodes from registry for health check: {}",
+                            e
+                        );
+                        default_endpoints
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ep)| (i.to_string(), ep.clone()))
+                            .collect()
+                    }
+                }
+            };
+
+            let now = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            for (node_id, endpoint) in nodes {
                 let url = format!("{}/health", endpoint);
-                let is_healthy = reqwest::get(&url)
+                let reachable = hc_client
+                    .get(&url)
+                    .send()
                     .await
                     .map(|r| r.status().is_success())
                     .unwrap_or(false);
 
+                // Strict mode refuses to treat an unattested peer as healthy.
+                let attested = node_attestation::is_attested(
+                    &attestation_store,
+                    &attestation_config,
+                    &node_id,
+                    now,
+                )
+                .await;
+                let is_healthy = reachable && attested;
+                if reachable && !attested {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        endpoint = %endpoint,
+                        "MPC node is reachable but unattested; refusing in strict mode"
+                    );
+                }
+
                 let mut guard = node_healths.lock().await;
-                if idx < guard.len() {
-                    let prev_connected = guard[idx].connected;
+                if let Some(node) = guard.iter_mut().find(|n| n.endpoint == endpoint) {
+                    let prev_connected = node.connected;
+                    let prev_draining = node.draining;
                     if is_healthy {
-                        guard[idx].connected = true;
-                        guard[idx].last_heartbeat = Some(SystemTime::now());
+                        node.connected = true;
+                        node.last_heartbeat = Some(chrono::Utc::now());
+                        node.draining = is_draining;
+                        if is_draining && !prev_draining {
+                            tracing::warn!("MPC Node ({}) entered DRAIN mode", endpoint);
+                        }
                     } else {
                         if prev_connected {
-                            tracing::warn!("MPC Node {} ({}) went offline", idx, endpoint);
+                            tracing::warn!("MPC Node ({}) went offline", endpoint);
                         }
-                        guard[idx].connected = false;
+                        node.connected = false;
+                        node.draining = false;
                     }
+                    node_draining_gauge
+                        .with_label_values(&[endpoint.as_str()])
+                        .set(if node.draining { 1.0 } else { 0.0 });
+                } else {
+                    // New node discovered
+                    guard.push(MpcNodeHealth {
+                        endpoint: endpoint.clone(),
+                        connected: is_healthy,
+                        last_heartbeat: if is_healthy {
+                            Some(chrono::Utc::now())
+                        } else {
+                            None
+                        },
+                        draining: is_draining,
+                    });
+                    node_draining_gauge
+                        .with_label_values(&[endpoint.as_str()])
+                        .set(if is_draining { 1.0 } else { 0.0 });
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         }
     });
 
+    // Snapshot drain state + active-session counter for the shutdown task
+    // (the `state` itself is moved into the router below).
+    let shutdown_drain = state.drain.clone();
+    let shutdown_active = state.metrics.active_mpc_sessions.clone();
+
     let app = Router::new()
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/", get(dashboard::dashboard_page))
         .route("/metrics", get(metrics_endpoint))
         .route("/api/health", get(health))
+        .route("/api/leader", get(get_leader_status))
         .route("/api/stats", get(get_stats))
+        .route("/api/benchmarks", get(get_benchmarks))
+        // Dynamic MPC node discovery (active only when neither the committee
+        // registry nor static MPC_NODE_* endpoints are configured).
+        .route("/api/node/register", post(api::register_node))
+        .route("/api/node/:id/heartbeat", post(api::node_heartbeat))
+        .route("/api/node/:id", delete(api::deregister_node))
+        // MPC node version negotiation (Issue #233)
+        .route("/api/mpc/version/register", post(register_node_version))
+        .route("/api/mpc/version/nodes", get(list_node_versions))
+        .route("/api/mpc/version/negotiate", get(negotiate_version))
+        // MPC node benchmarking suite (Issue #234)
+        .route("/api/mpc/benchmark/sample", post(record_node_benchmark))
+        .route("/api/mpc/benchmark/report", get(get_node_benchmark_report))
+        .route("/api/mpc/benchmark/sweep", post(run_node_benchmark_sweep))
+        // MPC network partition detection (Issue #236)
+        .route("/api/mpc/partition/report", post(submit_partition_report))
+        .route("/api/mpc/partition/status", get(get_partition_status))
+        // MPC node identity verification via Stellar addresses (Issue #237)
+        .route("/api/mpc/identity/register", post(register_node_identity))
+        .route("/api/mpc/identity/nodes", get(list_node_identities))
+        .route("/api/mpc/identity/verify", post(verify_node_identity))
+        // Node build-provenance attestation (Issue #587)
+        .route("/api/mpc/attestation", post(submit_node_attestation))
+        .route("/api/mpc/attestation/status", get(get_attestation_status))
+        // Committee node decommission / secure reshuffle (Issue #585)
+        .route("/api/mpc/decommission/status", get(get_decommission_status))
+        .route("/api/mpc/decommission/begin", post(begin_node_decommission))
+        .route("/api/mpc/decommission/plan", post(plan_node_reshuffle))
+        .route("/api/mpc/decommission/enact", post(enact_node_reshuffle))
+        .route("/api/mpc/decommission/cancel", post(cancel_node_decommission))
+        // MPC session preemption policy (Issue #588)
+        .route("/api/mpc/preemption/status", get(get_preemption_status))
+        // CSP violation report ingestion (Issue #136)
+        .route("/api/csp/report", post(api::csp::report_csp))
+        .route("/api/csp/reports", get(api::csp::list_csp_reports))
         .route("/api/flags", get(api::flags::list_flags))
         .route("/api/flags/:key", post(api::flags::set_flag))
         // Plugin management endpoints
@@ -478,6 +1369,9 @@ async fn main() {
         )
         .route("/api/tables/create", post(api::create_table))
         .route("/api/tables/open", get(api::list_open_tables))
+        .route("/api/tables/overview", get(api::list_table_overview))
+        .route("/api/stats/player/:address", get(get_player_hud_stats))
+        .route("/api/ratings/leaderboard", get(get_rating_leaderboard))
         .route("/api/chain-config", get(api::get_chain_config))
         .route("/api/table/:table_id/join", post(api::join_table))
         .route("/api/table/:table_id/lobby", get(api::get_table_lobby))
@@ -495,12 +1389,32 @@ async fn main() {
             post(api::player_action),
         )
         .route(
+            "/api/table/:table_id/transfer-chips",
+            post(api::transfer_chips),
+        )
+        .route("/api/table/:table_id/rit-opt-in", post(api::rit_opt_in))
+        .route(
             "/api/table/:table_id/player/:address/cards",
             get(api::get_player_cards),
         )
         .route("/api/table/:table_id/state", get(api::get_table_state))
+        .route(
+            "/api/table/:table_id/players",
+            get(api::get_players_paginated),
+        )
+        .route(
+            "/api/table/:table_id/hand-history/chunk",
+            get(api::get_hand_history_chunk),
+        )
+        .route("/api/table/:table_id/mpc-status", get(api::get_mpc_status))
         .route("/api/committee/status", get(api::committee_status))
         .route("/api/table/:table_id/chat/ws", get(chat_ws_handler))
+        .route("/api/table/:table_id/state/ws", get(game_state_ws_handler))
+        .route("/api/table/:table_id/spectate/ws", get(spectate_ws_handler))
+        .route(
+            "/api/table/:table_id/spectators",
+            get(api::get_spectator_count),
+        )
         .route(
             "/api/session/:session_id/cancel",
             post(api::cancel_mpc_session),
@@ -522,6 +1436,10 @@ async fn main() {
         )
         .route("/api/admin/stats", get(api::admin_stats))
         .route("/api/admin/config/reload", post(api::admin_reload_config))
+        .route(
+            "/api/admin/maintenance",
+            post(api::admin_toggle_maintenance),
+        )
         // New admin endpoints for issues #267, #261, #264, #265
         .route("/api/admin/rate-limits", get(api::admin_list_rate_limits))
         .route("/api/admin/rate-limits", post(api::admin_upsert_rate_limit))
@@ -542,6 +1460,10 @@ async fn main() {
         )
         .route("/api/admin/migrations", get(api::admin_list_migrations))
         .route(
+            "/api/admin/committee-key-rotation",
+            get(api::admin_committee_key_rotation_status),
+        )
+        .route(
             "/api/admin/migrations/initiate",
             post(api::admin_initiate_migration),
         )
@@ -553,19 +1475,152 @@ async fn main() {
             "/api/admin/migrations/:id/cancel",
             post(api::admin_cancel_migration),
         )
+        // Session archiving endpoints (Issue #259)
+        .route("/api/admin/archives", get(api::admin_list_archives))
+        .route(
+            "/api/admin/archives/:archive_id",
+            get(api::admin_get_archive),
+        )
+        .route("/api/admin/archives/purge", post(api::admin_purge_archives))
+        // Readiness probe for blue-green cutover (Issue #340): unlike
+        // `/api/health`, returns 503 while draining/maintenance.
+        .route("/api/readyz", get(api::readiness))
+        // Drain protocol + maintenance toggle (Issue #340).
+        .route(
+            "/api/admin/drain",
+            get(api::admin_drain_status)
+                .post(api::admin_start_drain)
+                .delete(api::admin_cancel_drain),
+        )
+        // Circuit (VK) rollout administration.
+        .route("/api/admin/vk-rollout", get(api::admin_rollout_status))
+        .route(
+            "/api/admin/vk-rollout/rollback",
+            post(api::admin_rollout_rollback),
+        )
+        .route(
+            "/api/admin/vk-rollout/promote",
+            post(api::admin_rollout_promote),
+        )
+        .route(
+            "/api/admin/anti-dumping/reports",
+            get(api::admin_anti_dumping_reports),
+        )
+        // Tournament (sit-and-go) endpoints (Issue #17)
+        .route(
+            "/api/tournaments",
+            get(api::tournament_api::list_tournaments),
+        )
+        .route(
+            "/api/tournaments",
+            post(api::tournament_api::create_tournament),
+        )
+        .route(
+            "/api/tournaments/:id",
+            get(api::tournament_api::get_tournament),
+        )
+        .route(
+            "/api/tournaments/:id/register",
+            post(api::tournament_api::register_player),
+        )
+        .route(
+            "/api/tournaments/:id/start",
+            post(api::tournament_api::start_tournament),
+        )
+        .route(
+            "/api/tournaments/:id/hand-result",
+            post(api::tournament_api::record_hand_result),
+        )
+        .route(
+            "/api/tournaments/:id/balancing",
+            get(api::tournament_api::get_balancing),
+        )
+        .route(
+            "/api/tournaments/:id/cancel",
+            post(api::tournament_api::cancel_tournament),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.idempotency_store.clone(),
+            idempotency::idempotency_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.drain.clone(),
+            drain::drain_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            maintenance_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            mpc_auth_middleware::authenticate_mpc_request,
+        ))
         .layer(middleware::from_fn(request_log::log_request))
+        .layer(axum::middleware::from_fn_with_state(
+            rate_limit::RateLimitMiddlewareState {
+                buckets: state.ip_buckets.clone(),
+                rejections: state.rejection_counter.clone(),
+            },
+            rate_limit::ip_rate_limit_middleware,
+        ))
         .layer(build_cors_layer(state.db_pool.as_deref()).await)
+        .layer(middleware::from_fn(api_version::rewrite_and_tag_version))
+        // Outermost: give every error response a stable machine-readable code.
+        .layer(middleware::from_fn(errors::error_response_middleware))
         .with_state(state);
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     tracing::info!("Coordinator listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_drain, shutdown_active))
+        .await
+        .unwrap();
+}
+
+/// Wait for SIGTERM/SIGINT, enter drain mode, then give in-flight MPC sessions
+/// a bounded window to finish before the process exits (blue-green drain,
+/// Issue #340). The window is `DRAIN_TIMEOUT_SECS` (default 30s).
+async fn shutdown_signal(
+    drain: drain::DrainState,
+    active_sessions: Arc<AtomicUsize>,
+) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::warn!("Received Ctrl+C — beginning graceful shutdown"),
+        _ = terminate => tracing::warn!("Received SIGTERM — beginning graceful shutdown"),
+    }
+
+    let grace = drain::DrainState::grace_secs_from_env();
+    drain.begin("shutdown signal", grace).await;
+    let remaining = drain.wait_for_sessions(active_sessions).await;
+    if remaining > 0 {
+        tracing::warn!(
+            "Shutting down with {} in-flight MPC session(s) past the grace window",
+            remaining
+        );
+    }
 }
 
 async fn build_cors_layer(db_pool: Option<&sqlx::PgPool>) -> CorsLayer {
@@ -600,22 +1655,6 @@ async fn build_cors_layer(db_pool: Option<&sqlx::PgPool>) -> CorsLayer {
         .allow_credentials(true)
 }
 
-#[derive(Serialize)]
-struct HealthResponse {
-    uptime_seconds: u64,
-    mpc_nodes: Vec<MpcNodeHealth>,
-    soroban_rpc: SorobanHealth,
-    active_mpc_sessions: usize,
-    request_metrics: HashMap<String, RouteMetric>,
-    chain_cache: chain_cache::CacheStats,
-}
-
-#[derive(Serialize)]
-struct SorobanHealth {
-    endpoint: String,
-    status: String,
-}
-
 async fn check_soroban_connectivity(rpc_url: &str) -> bool {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
@@ -631,6 +1670,14 @@ async fn check_soroban_connectivity(rpc_url: &str) -> bool {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Health information", body = HealthResponse)
+    )
+)]
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let uptime_seconds = state.metrics.boot_time.elapsed().as_secs();
     let mpc_nodes = state.metrics.node_healths.lock().await.clone();
@@ -662,6 +1709,13 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let active_mpc_sessions = state.metrics.active_mpc_sessions.load(Ordering::SeqCst);
     let request_metrics = state.metrics.route_metrics.lock().await.clone();
     let chain_cache_stats = state.chain_cache.stats().await;
+    let maintenance_mode = state.maintenance_mode.load(Ordering::Relaxed);
+    let draining = state.drain.is_draining();
+
+    let contract_deployment = ContractDeployment {
+        configured: state.soroban_config.is_configured(),
+        contract_id: state.soroban_config.poker_table_contract.clone(),
+    };
 
     Json(HealthResponse {
         uptime_seconds,
@@ -670,10 +1724,27 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
             endpoint: state.soroban_config.rpc_url.clone(),
             status: soroban_status,
         },
+        contract_deployment,
         active_mpc_sessions,
         request_metrics,
         chain_cache: chain_cache_stats,
+        maintenance_mode,
+        draining,
     })
+}
+
+async fn maintenance_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.maintenance_mode.load(Ordering::Relaxed) {
+        let path = req.uri().path();
+        if !path.starts_with("/api/admin") {
+            return errors::ApiError::new("maintenance").into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn metrics_middleware(
@@ -685,7 +1756,7 @@ async fn metrics_middleware(
     let method = req.method().to_string();
     let route = format!("{} {}", method, path);
 
-    if path == "/api/health" || path.ends_with("/chat/ws") {
+    if path == "/api/health" || path.ends_with("/chat/ws") || path.ends_with("/state/ws") {
         return next.run(req).await;
     }
 
@@ -752,26 +1823,6 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
         .unwrap()
 }
 
-fn sanitize_chat_message(input: &str) -> String {
-    let trimmed = input.trim();
-    let limited = if trimmed.len() > 128 {
-        &trimmed[..128]
-    } else {
-        trimmed
-    };
-    limited.replace('<', "&lt;").replace('>', "&gt;")
-}
-
-fn sanitize_alias(input: &str) -> String {
-    let trimmed = input.trim();
-    let limited = if trimmed.len() > 24 {
-        &trimmed[..24]
-    } else {
-        trimmed
-    };
-    limited.replace('<', "&lt;").replace('>', "&gt;")
-}
-
 async fn chat_ws_handler(
     ws: WebSocketUpgrade,
     axum::extract::Path(table_id): axum::extract::Path<u32>,
@@ -804,26 +1855,24 @@ async fn handle_chat_socket(socket: WebSocket, table_id: u32, state: AppState) {
         }
     });
 
+    // Every frame is validated and sanitized before it is relayed, and each
+    // connection is rate limited (Issue #140) — see `chat.rs`.
     let mut recv_task = tokio::spawn(async move {
+        let mut limiter = chat::ChatRateLimiter::default();
         while let Some(Ok(msg)) = ws_receiver.next().await {
-            if let Ok(text) = msg.to_text() {
-                if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(text) {
-                    if let Some(text_val) = json_val.get_mut("text") {
-                        if let Some(s) = text_val.as_str() {
-                            let sanitized = sanitize_chat_message(s);
-                            *text_val = serde_json::Value::String(sanitized);
-                        }
-                    }
-                    if let Some(alias_val) = json_val.get_mut("alias") {
-                        if let Some(s) = alias_val.as_str() {
-                            let sanitized = sanitize_alias(s);
-                            *alias_val = serde_json::Value::String(sanitized);
-                        }
-                    }
-
-                    if let Ok(broadcast_msg) = serde_json::to_string(&json_val) {
-                        let _ = tx.send(broadcast_msg);
-                    }
+            let Ok(text) = msg.to_text() else {
+                continue;
+            };
+            if !limiter.allow(Instant::now()) {
+                tracing::warn!(table_id, "chat frame dropped: rate limit exceeded");
+                continue;
+            }
+            match chat::process_incoming_frame(text) {
+                Ok(broadcast_msg) => {
+                    let _ = tx.send(broadcast_msg);
+                }
+                Err(reason) => {
+                    tracing::debug!(table_id, %reason, "chat frame dropped");
                 }
             }
         }
@@ -835,11 +1884,619 @@ async fn handle_chat_socket(socket: WebSocket, table_id: u32, state: AppState) {
     }
 }
 
+/// GET /api/table/{table_id}/state/ws
+///
+/// Real-time game state push (Issue #105). Sends the connecting client an
+/// immediate snapshot, then a fresh snapshot every time the table's phase,
+/// cards, or on-chain betting state changes (deal/reveal/showdown/player
+/// actions). Server push only — the coordinator does not read anything the
+/// client sends on this socket. Clients that can't hold a WebSocket open
+/// (or whose upgrade fails) should fall back to polling
+/// `GET /api/table/:table_id/state`.
+async fn game_state_ws_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::Path(table_id): axum::extract::Path<u32>,
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token_table = ws_token_table(params.get("session"));
+    let token_player = ws_token_player(params.get("session"));
+    ws.on_upgrade(move |socket| {
+        handle_game_state_socket(socket, table_id, state, token_table, token_player)
+    })
+}
+
+/// Parse the `table-<id>` table binding from a WS subscription token.
+fn ws_token_table(token: Option<&String>) -> Option<u32> {
+    let t = token?;
+    let mut parts = t.splitn(3, '-');
+    if parts.next()? != "table" {
+        return None;
+    }
+    parts.next()?.parse::<u32>().ok()
+}
+
+/// Parse the `<address>` player binding from a `table-<id>-<address>` token.
+fn ws_token_player(token: Option<&String>) -> Option<String> {
+    let t = token?;
+    let mut parts = t.splitn(3, '-');
+    if parts.next()? != "table" {
+        return None;
+    }
+    let _ = parts.next()?;
+    Some(parts.next()?.to_string())
+}
+
+async fn handle_game_state_socket(
+    socket: WebSocket,
+    table_id: u32,
+    state: AppState,
+    token_table: Option<u32>,
+    token_player: Option<String>,
+) {
+    // Issue #509: only a seated player carrying a token bound to this table may
+    // subscribe to its state topic. Cross-session subscription attempts are
+    // denied and audited before any snapshot is pushed.
+    let denied = {
+        let tables = state.tables.read().await;
+        tables.get(&table_id).map_or_else(
+            || Some(session_isolation::IsolationDenial::InvalidSessionToken),
+            |session| {
+                session_isolation::authorize_subscribe(
+                    table_id,
+                    token_table,
+                    token_player.as_deref(),
+                    &session.player_order,
+                )
+                .err()
+            },
+        )
+    };
+    if let Some(denial) = denied {
+        api::record_isolation_denial(
+            &state,
+            table_id,
+            token_player.as_deref().unwrap_or("unknown"),
+            session_isolation::IsolationOperation::SubscribeState,
+            denial,
+        )
+        .await;
+        tracing::warn!(
+            "Isolation denial on WS subscribe: table {}, player {:?}, reason {}",
+            table_id,
+            token_player,
+            denial.as_str()
+        );
+        return;
+    }
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    let tx = {
+        let mut channels = state.game_state_channels.lock().await;
+        channels
+            .entry(table_id)
+            .or_insert_with(|| {
+                let (tx, _) = tokio::sync::broadcast::channel(100);
+                tx
+            })
+            .clone()
+    };
+    let mut rx = tx.subscribe();
+
+    // Greet the client with the current snapshot immediately, so it doesn't
+    // have to wait for the next state-changing action.
+    if let Some(snapshot) = api::current_game_state_json(&state, table_id).await {
+        if ws_sender
+            .send(Message::Text(snapshot.into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(msg_str) = rx.recv().await {
+            if ws_sender.send(Message::Text(msg_str.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Server-push only: drain (and discard) whatever the client sends, e.g.
+    // pings, so the socket's read half doesn't back up and the coordinator
+    // notices when the client disconnects.
+    let mut recv_task = tokio::spawn(async move { while ws_receiver.next().await.is_some() {} });
+
+    tokio::select! {
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
+    }
+}
+
+/// GET /api/table/{table_id}/spectate/ws
+///
+/// Anonymous spectator stream (Issue #171). No wallet or auth required.
+/// Delivers the same public game-state snapshots as `/state/ws` (community
+/// cards, phase, on-chain betting state — never hole cards) and counts the
+/// connection towards the table's spectator indicator for as long as it
+/// stays open. Every join/leave broadcasts a `{"type":"spectators"}` frame
+/// on the table's game-state channel.
+async fn spectate_ws_handler(
+    ws: WebSocketUpgrade,
+    axum::extract::Path(table_id): axum::extract::Path<u32>,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_spectator_socket(socket, table_id, state))
+}
+
+async fn handle_spectator_socket(socket: WebSocket, table_id: u32, state: AppState) {
+    let guard = state.spectators.join(table_id);
+    broadcast_spectator_count(&state, table_id).await;
+
+    handle_game_state_socket(socket, table_id, state.clone(), None, None).await;
+
+    drop(guard);
+    broadcast_spectator_count(&state, table_id).await;
+}
+
+async fn broadcast_spectator_count(state: &AppState, table_id: u32) {
+    let msg = spectators::spectator_count_message(table_id, state.spectators.count(table_id));
+    let channels = state.game_state_channels.lock().await;
+    if let Some(tx) = channels.get(&table_id) {
+        let _ = tx.send(msg);
+    }
+}
+
 /// GET /api/stats
 ///
 /// Returns global statistics and a top-10 leaderboard, served from an
 /// in-memory cache with a 30-second TTL.
+#[utoipa::path(
+    get,
+    path = "/api/stats",
+    tag = "Health",
+    responses(
+        (status = 200, description = "Statistics payload", body = stats::StatsResponse)
+    )
+)]
 async fn get_stats(State(state): State<AppState>) -> Json<stats::StatsResponse> {
     let ttl = std::time::Duration::from_secs(30);
     Json(stats::get_stats(&state.stats, ttl).await)
+}
+
+/// GET /api/stats/player/:address — HUD stats for seat tooltip (Issue #55).
+async fn get_player_hud_stats(
+    State(state): State<AppState>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> Json<stats::PlayerHudStats> {
+    Json(stats::get_player_hud(&state.stats, &address).await)
+}
+
+/// GET /api/ratings/leaderboard — on-chain ELO leaderboard cache (Issue #70).
+async fn get_rating_leaderboard(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<stats::RatingLeaderboardResponse> {
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 50);
+    stats::ensure_demo_ratings(&state.stats).await;
+    Json(stats::get_rating_leaderboard(&state.stats, offset, limit).await)
+}
+
+async fn get_benchmarks(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let benchmarks = mpc_benchmark::get_benchmarks(&state.benchmark_store, None);
+    let stats = mpc_benchmark::get_benchmark_stats(&benchmarks);
+    Json(serde_json::json!({
+        "samples": benchmarks,
+        "stats": stats,
+    }))
+}
+
+// -- MPC node version negotiation (Issue #233) --------------------------
+
+/// POST /api/mpc/version/register
+///
+/// An MPC node reports the protocol versions and per-circuit ACIR versions
+/// it supports. Called once at node startup and whenever a node upgrades.
+async fn register_node_version(
+    State(state): State<AppState>,
+    Json(caps): Json<mpc_version::NodeCapabilities>,
+) -> axum::http::StatusCode {
+    mpc_version::register_capabilities(&state.version_registry, caps).await;
+    axum::http::StatusCode::NO_CONTENT
+}
+
+/// GET /api/mpc/version/nodes
+///
+/// Snapshot of every node's last-reported version capabilities.
+async fn list_node_versions(
+    State(state): State<AppState>,
+) -> Json<Vec<mpc_version::NodeCapabilities>> {
+    Json(mpc_version::list_capabilities(&state.version_registry).await)
+}
+
+/// GET /api/mpc/version/negotiate?nodes=0,1,2&circuits=deal,reveal
+///
+/// Negotiates the highest protocol version and per-circuit version supported
+/// by every listed node. Returns 409 if there's no mutually-compatible
+/// version.
+async fn negotiate_version(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<mpc_version::SessionVersionPlan>, (axum::http::StatusCode, String)> {
+    let node_ids: Vec<String> = params
+        .get("nodes")
+        .map(|s| s.split(',').map(|n| n.trim().to_string()).collect())
+        .unwrap_or_default();
+    if node_ids.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "missing 'nodes' query param".to_string(),
+        ));
+    }
+    let circuit_names: Vec<String> = params
+        .get("circuits")
+        .map(|s| s.split(',').map(|c| c.trim().to_string()).collect())
+        .unwrap_or_default();
+    let circuit_refs: Vec<&str> = circuit_names.iter().map(|s| s.as_str()).collect();
+
+    let channel = params
+        .get("channel")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .or_else(|| std::env::var("COORDINATOR_RELEASE_CHANNEL").ok())
+        .unwrap_or_else(|| "stable".to_string());
+    let channel = match channel.as_str() {
+        "stable" => mpc_version::ReleaseChannel::Stable,
+        "canary" => mpc_version::ReleaseChannel::Canary,
+        _ => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "channel must be stable or canary".to_string(),
+            ))
+        }
+    };
+
+    mpc_version::negotiate_session(&state.version_registry, &node_ids, &circuit_refs, channel)
+        .await
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e))
+}
+
+// -- MPC node benchmarking suite (Issue #234) ----------------------------
+
+/// POST /api/mpc/benchmark/sample
+///
+/// An MPC node self-reports a performance sample (proof throughput, memory,
+/// CPU) for a session or probing interval.
+async fn record_node_benchmark(
+    State(state): State<AppState>,
+    Json(sample): Json<mpc_node_benchmark::NodeBenchmarkSample>,
+) -> axum::http::StatusCode {
+    mpc_node_benchmark::record_sample(&state.node_benchmark_store, sample);
+    axum::http::StatusCode::NO_CONTENT
+}
+
+/// GET /api/mpc/benchmark/report
+///
+/// Aggregated per-node performance report (avg/min/max throughput, latency,
+/// memory, CPU) built from all recorded samples.
+async fn get_node_benchmark_report(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let samples = mpc_node_benchmark::get_samples(&state.node_benchmark_store, None);
+    let report = mpc_node_benchmark::generate_report(&samples);
+    Json(serde_json::json!({
+        "sample_count": samples.len(),
+        "report": report,
+    }))
+}
+
+/// POST /api/mpc/benchmark/sweep
+///
+/// Actively probes every configured MPC node's `/health` endpoint right now
+/// to measure network latency (and any self-reported resource metrics),
+/// recording the results.
+async fn run_node_benchmark_sweep(
+    State(state): State<AppState>,
+) -> Json<Vec<mpc_node_benchmark::NodeBenchmarkSample>> {
+    let nodes: Vec<(String, String)> = state
+        .mpc_config
+        .node_endpoints
+        .iter()
+        .enumerate()
+        .map(|(i, endpoint)| (i.to_string(), endpoint.clone()))
+        .collect();
+    let samples = mpc_node_benchmark::run_benchmark_sweep(
+        &state.node_benchmark_store,
+        &state.mpc_client,
+        &nodes,
+    )
+    .await;
+    Json(samples)
+}
+
+// -- MPC network partition detection (Issue #236) ------------------------
+
+#[derive(Deserialize)]
+struct PartitionReportRequest {
+    reporter_node_id: String,
+    unreachable_nodes: Vec<String>,
+}
+
+/// POST /api/mpc/partition/report
+///
+/// An MPC node reports which peers it currently cannot reach. The
+/// coordinator only declares a node partitioned once a quorum of its peers
+/// independently confirm the same thing.
+async fn submit_partition_report(
+    State(state): State<AppState>,
+    Json(req): Json<PartitionReportRequest>,
+) -> axum::http::StatusCode {
+    let all_node_ids: Vec<String> = if state.mpc_config.node_endpoints.is_empty() {
+        state.node_registry.read().await.healthy_node_ids()
+    } else {
+        (0..state.mpc_config.node_endpoints.len())
+            .map(|i| i.to_string())
+            .collect()
+    };
+
+    let mut detector = state.partition_store.write().await;
+    detector.submit_report(
+        &req.reporter_node_id,
+        req.unreachable_nodes.into_iter().collect(),
+        &all_node_ids,
+    );
+    axum::http::StatusCode::NO_CONTENT
+}
+
+/// GET /api/mpc/partition/status
+///
+/// Currently partitioned nodes and any sessions paused as a result.
+async fn get_partition_status(
+    State(state): State<AppState>,
+) -> Json<mpc_partition::PartitionStatus> {
+    let detector = state.partition_store.read().await;
+    Json(detector.status())
+}
+
+// -- MPC node identity verification (Issue #237) -------------------------
+
+#[derive(Deserialize)]
+struct RegisterNodeIdentityRequest {
+    node_id: String,
+    stellar_address: String,
+}
+
+/// POST /api/mpc/identity/register
+///
+/// Registers (or updates) the Stellar address the coordinator trusts for a
+/// given MPC node id in the committee registry. Intended for admin/operator
+/// use when onboarding or rotating a node's keypair.
+async fn register_node_identity(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterNodeIdentityRequest>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    mpc_identity::register_node_identity(
+        &state.committee_registry,
+        &req.node_id,
+        &req.stellar_address,
+    )
+    .await
+    .map(|_| axum::http::StatusCode::NO_CONTENT)
+    .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))
+}
+
+/// GET /api/mpc/identity/nodes
+///
+/// The committee registry: MPC node id -> trusted Stellar address.
+async fn list_node_identities(State(state): State<AppState>) -> Json<HashMap<String, String>> {
+    Json(state.committee_registry.read().await.clone())
+}
+
+/// POST /api/mpc/identity/verify
+///
+/// Verifies that a session message was genuinely signed by the Stellar
+/// keypair registered for its `node_id` in the committee registry.
+async fn verify_node_identity(
+    State(state): State<AppState>,
+    Json(msg): Json<mpc_identity::SignedSessionMessage>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    mpc_identity::verify_session_message_with_tracker(
+        &state.committee_registry,
+        &msg,
+        Some(&state.mpc_nonce_tracker),
+    )
+    .await
+    .map(|_| axum::http::StatusCode::NO_CONTENT)
+    .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e))
+}
+
+// -- Node build-provenance attestation (Issue #587) ----------------------
+
+/// POST /api/mpc/attestation
+///
+/// An MPC node reports a signed statement of the binary it is running. The
+/// signature is verified against the committee registry; an optional hash
+/// allow-list and freshness window are also enforced.
+async fn submit_node_attestation(
+    State(state): State<AppState>,
+    Json(att): Json<node_attestation::BuildAttestation>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    node_attestation::submit_attestation(
+        &state.attestation_store,
+        &state.attestation_config,
+        &state.committee_registry,
+        att,
+    )
+    .await
+    .map(|_| axum::http::StatusCode::NO_CONTENT)
+    .map_err(|e| (axum::http::StatusCode::UNAUTHORIZED, e.to_string()))
+}
+
+/// GET /api/mpc/attestation/status
+///
+/// Every recorded attestation plus the current policy (strict mode, number of
+/// accepted hashes).
+async fn get_attestation_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stored = node_attestation::list_attestations(&state.attestation_store).await;
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let max_age = state.attestation_config.max_age_seconds;
+    let nodes: Vec<serde_json::Value> = stored
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "node_id": s.attestation.node_id,
+                "binary_sha256": s.attestation.binary_sha256,
+                "package_version": s.attestation.package_version,
+                "git_commit": s.attestation.git_commit,
+                "slsa_level": s.attestation.slsa_level,
+                "signer": s.attestation.signer,
+                "received_at": s.received_at,
+                "fresh": max_age <= 0 || now - s.received_at <= max_age,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "strict": state.attestation_config.strict,
+        "accepted_hashes": state.attestation_config.accepted_binary_hashes.len(),
+        "attested_nodes": nodes,
+    }))
+}
+
+// -- Committee node decommission / secure reshuffle (Issue #585) ---------
+
+#[derive(Deserialize)]
+struct BeginDecommissionRequest {
+    node_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReshuffleRequest {
+    node_id: String,
+    replacement_node: String,
+    #[serde(default)]
+    identity_preserved: bool,
+}
+
+#[derive(Deserialize)]
+struct NodeIdRequest {
+    node_id: String,
+}
+
+/// GET /api/mpc/decommission/status
+async fn get_decommission_status(
+    State(state): State<AppState>,
+) -> Json<Vec<node_decommission::NodeDecommissionStatus>> {
+    Json(state.decommission.read().await.status())
+}
+
+/// POST /api/mpc/decommission/begin
+///
+/// Start draining a node: no new sessions are assigned to it.
+async fn begin_node_decommission(
+    State(state): State<AppState>,
+    Json(req): Json<BeginDecommissionRequest>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    state
+        .decommission
+        .write()
+        .await
+        .begin(req.node_id, Instant::now())
+        .map(|_| axum::http::StatusCode::NO_CONTENT)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))
+}
+
+/// POST /api/mpc/decommission/plan
+///
+/// Plan a reshuffle of a drained node onto a replacement. `identity_preserved`
+/// must be set only when the replacement holds the same REP3 party identity.
+async fn plan_node_reshuffle(
+    State(state): State<AppState>,
+    Json(req): Json<ReshuffleRequest>,
+) -> Result<Json<node_decommission::ReshufflePlan>, (axum::http::StatusCode, String)> {
+    state
+        .decommission
+        .write()
+        .await
+        .plan_reshuffle(
+            &req.node_id,
+            req.replacement_node,
+            req.identity_preserved,
+            Instant::now(),
+        )
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))
+}
+
+/// POST /api/mpc/decommission/enact
+///
+/// Finalize a planned reshuffle and mark the node decommissioned.
+async fn enact_node_reshuffle(
+    State(state): State<AppState>,
+    Json(req): Json<NodeIdRequest>,
+) -> Result<Json<node_decommission::ReshufflePlan>, (axum::http::StatusCode, String)> {
+    state
+        .decommission
+        .write()
+        .await
+        .enact_reshuffle(&req.node_id)
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))
+}
+
+/// POST /api/mpc/decommission/cancel
+///
+/// Cancel a decommission (e.g. the node was repaired) and allow it to accept
+/// sessions again.
+async fn cancel_node_decommission(
+    State(state): State<AppState>,
+    Json(req): Json<NodeIdRequest>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    state
+        .decommission
+        .write()
+        .await
+        .cancel(&req.node_id)
+        .map(|_| axum::http::StatusCode::NO_CONTENT)
+        .map_err(|e| (axum::http::StatusCode::CONFLICT, e.to_string()))
+}
+
+// -- MPC session preemption policy (Issue #588) --------------------------
+
+/// GET /api/mpc/preemption/status
+async fn get_preemption_status(
+    State(state): State<AppState>,
+) -> Json<session_preemption::PreemptionStatus> {
+    Json(state.preemption.read().await.status())
+}
+
+/// GET /api/leader
+///
+/// Reports whether this coordinator instance is the current leader.
+///
+/// Clients can use this to:
+/// - Route write requests (new sessions, proof submissions) to the leader.
+/// - Implement circuit-breaker logic in proxies.
+/// - Alert when the cluster has no leader (all instances report `false`).
+///
+/// Response:
+/// ```json
+/// { "is_leader": true,  "instance_id": "abc123" }
+/// { "is_leader": false, "instance_id": "def456" }
+/// ```
+async fn get_leader_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "is_leader": state.leader_state.is_leader(),
+        "instance_id": state.instance_id,
+    }))
 }

@@ -1,11 +1,14 @@
+/** Wallet Type shape. */
 export type WalletType = "freighter" | "lobstr";
 
+/** Wallet Session shape. */
 export interface WalletSession {
   address: string;
   walletType: WalletType;
   signMessage: (message: string) => Promise<string>;
 }
 
+/** Wallet Info shape. */
 export interface WalletInfo {
   type: WalletType;
   name: string;
@@ -16,12 +19,16 @@ import {
   connectFreighterWallet as connectFreighter,
   trySilentReconnect as tryReconnectFreighter,
   isFreighterInstalled,
+  getActiveAddress as freighterGetActiveAddress,
+  clearSavedWallet as clearFreighterWallet,
+  getActiveAddress as getActiveFreighterAddress,
 } from "./freighter";
 
 import {
   connectLobstrWallet as connectLobstr,
   trySilentReconnectLobstr as tryReconnectLobstr,
   isLobstrInstalled,
+  clearSavedWallet as clearLobstrWallet,
 } from "./lobstr";
 
 const WALLET_META: Record<WalletType, { name: string }> = {
@@ -29,6 +36,10 @@ const WALLET_META: Record<WalletType, { name: string }> = {
   lobstr: { name: "Lobstr" },
 };
 
+/** Detect Installed Wallets.
+ * @returns WalletInfo[].
+ * @remarks Reads wallet state; connecting may trigger a wallet popup.
+ */
 export function detectInstalledWallets(): WalletInfo[] {
   const results: WalletInfo[] = [];
 
@@ -60,6 +71,11 @@ export function detectInstalledWallets(): WalletInfo[] {
   return results;
 }
 
+/** Connect Wallet.
+ * @param type - type.
+ * @returns Promise<WalletSession>.
+ * @remarks Reads wallet state; connecting may trigger a wallet popup.
+ */
 export async function connectWallet(type: WalletType): Promise<WalletSession> {
   switch (type) {
     case "freighter":
@@ -69,6 +85,10 @@ export async function connectWallet(type: WalletType): Promise<WalletSession> {
   }
 }
 
+/** Try Silent Reconnect.
+ * @returns Promise<WalletSession | null>.
+ * @remarks Reads wallet state; connecting may trigger a wallet popup.
+ */
 export async function trySilentReconnect(): Promise<WalletSession | null> {
   const freighterSession = await tryReconnectFreighter();
   if (freighterSession) return freighterSession;
@@ -79,7 +99,58 @@ export async function trySilentReconnect(): Promise<WalletSession | null> {
   return null;
 }
 
+/** Loads Wallet Display Name.
+ * @param session - session.
+ * @returns string.
+ * @remarks Reads wallet state; connecting may trigger a wallet popup.
+ */
 export function getWalletDisplayName(session: WalletSession): string {
   const meta = WALLET_META[session.walletType];
   return meta ? meta.name : session.walletType;
+}
+
+/** Loads Active Address.
+ * @returns Promise<string | null>.
+ * @remarks Reads wallet state; connecting may trigger a wallet popup.
+ */
+export async function getActiveAddress(): Promise<string | null> {
+  return freighterGetActiveAddress();
+}
+
+/**
+ * Checks whether the given wallet type is still connected.
+ * Used by useWalletMonitor to detect disconnection without showing a popup.
+ */
+export async function checkWalletStillConnected(walletType: WalletType): Promise<boolean> {
+  switch (walletType) {
+    case "freighter": {
+      const addr = await freighterGetActiveAddress();
+      return addr !== null;
+    }
+    case "lobstr": {
+      if (typeof window === "undefined") return false;
+      const api = (window as Window & { lobstr?: { getAddress?: () => Promise<unknown> } }).lobstr;
+      if (!api || typeof api.getAddress !== "function") return false;
+      try {
+        const result = await api.getAddress();
+        return typeof result === "string"
+          ? result.length > 0
+          : typeof result === "object" && result !== null && !("error" in result);
+      } catch {
+        return false;
+      }
+    }
+  }
+}
+
+/** Clears the saved wallet address from localStorage for the given wallet type. */
+export function clearWallet(walletType: WalletType): void {
+  switch (walletType) {
+    case "freighter":
+      clearFreighterWallet();
+      break;
+    case "lobstr":
+      clearLobstrWallet();
+      break;
+  }
 }
