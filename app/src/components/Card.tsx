@@ -1,6 +1,7 @@
 "use client";
 
 import type { CSSProperties } from "react";
+import { isReducedDataMode } from "@/lib/reduced-data-mode";
 import { decodeCard } from "@/lib/cards";
 import type { HandStrength } from "@/lib/hand-strength";
 import { getHandStrengthColor, getHandStrengthLabel } from "@/lib/hand-strength";
@@ -160,6 +161,7 @@ function CardFace({ value, d, className, strength }: { value: number; d: CardDim
  */
 export function Card({ value, faceDown = false, size = "md", flip = false, flipDelay = 0, dealFrom, strength = null }: CardProps) {
   const d = DIMS[size];
+  const reducedData = isReducedDataMode();
 
   if (faceDown || value === undefined) {
     return (
@@ -170,7 +172,7 @@ export function Card({ value, faceDown = false, size = "md", flip = false, flipD
   }
 
   // 3D flip: render both faces and rotate from back (180deg) to front (0deg).
-  if (flip) {
+  if (flip && !reducedData) {
     return (
       <div className="card-responsive inline-block">
         <div
@@ -198,7 +200,7 @@ export function Card({ value, faceDown = false, size = "md", flip = false, flipD
 
   return (
     <div className="card-responsive inline-block">
-      <CardFace value={value} d={d} className="animate-card-deal" strength={strength} />
+      <CardFace value={value} d={d} className={reducedData ? undefined : "animate-card-deal"} strength={strength} />
     </div>
   );
 }
