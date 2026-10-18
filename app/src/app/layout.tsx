@@ -3,6 +3,7 @@ import "./globals.css";
 import { I18nProvider } from "@/lib/i18n/context";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { NotificationsCenter } from "@/components/NotificationsCenter";
+import { ReducedDataToggle } from "@/components/ReducedDataToggle";
 
 /** Metadata.
  * @param Safari - Safari.
@@ -39,6 +40,7 @@ export default function RootLayout({
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <NotificationsCenter />
               <ThemeToggle />
+              <ReducedDataToggle />
             </div>
           </div>
           {children}
