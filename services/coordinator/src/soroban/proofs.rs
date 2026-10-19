@@ -7,6 +7,19 @@ use super::{
     invoke_contract_with_retries, parse_tx_result, resolve_onchain_table_id, SorobanConfig,
 };
 
+/// Validate proof bytes and public inputs before invoking the Stellar CLI.
+/// This is a structural pre-flight check: full UltraHonk verification remains
+/// the contract's responsibility, but malformed proofs are rejected before a
+/// transaction is simulated or submitted.
+pub fn verify_proof_preflight(proof: &[u8], public_inputs: &[String]) -> Result<(), String> {
+    if proof.is_empty() {
+        return Err("proof is empty".to_string());
+    }
+    convert_keccak_proof_to_soroban(proof)?;
+    public_inputs_to_hex(public_inputs)?;
+    Ok(())
+}
+
 /// Submit a deal proof to the on-chain poker-table contract via `commit_deal`.
 pub async fn submit_deal_proof(
     config: &SorobanConfig,
@@ -20,6 +33,8 @@ pub async fn submit_deal_proof(
         tracing::warn!("Soroban not configured, skipping deal proof submission");
         return Ok(String::new());
     }
+
+    verify_proof_preflight(proof, public_inputs)?;
 
     // Issue #108: content-addressable cache of already-verified proofs, so a
     // retried submission of byte-identical proof data skips the (expensive)
@@ -130,6 +145,8 @@ pub async fn submit_reveal_proof(
         return Ok(String::new());
     }
 
+    verify_proof_preflight(proof, public_inputs)?;
+
     let cache_key = crate::proof_cache::proof_key(proof, public_inputs);
     if let Some(tx_hash) = crate::proof_cache::get(&cache_key).await {
         tracing::info!("Reveal proof cache hit — skipping redundant on-chain verification");
@@ -183,6 +200,8 @@ pub async fn submit_showdown_proof(
         tracing::warn!("Soroban not configured, skipping showdown proof submission");
         return Ok(String::new());
     }
+
+    verify_proof_preflight(proof, public_inputs)?;
 
     let cache_key = crate::proof_cache::proof_key(proof, public_inputs);
     if let Some(tx_hash) = crate::proof_cache::get(&cache_key).await {
@@ -512,6 +531,18 @@ mod error_handling_tests {
         let err = convert_keccak_proof_to_soroban(&[]).unwrap_err();
         // 0 fields => log_n_calc = -75 <= 0.
         assert!(err.contains("cannot derive log_n"), "got: {err}");
+    }
+
+    #[test]
+    fn preflight_rejects_before_submission_for_empty_proof() {
+        let err = verify_proof_preflight(&[], &[]).unwrap_err();
+        assert_eq!(err, "proof is empty");
+    }
+
+    #[test]
+    fn preflight_rejects_malformed_proof() {
+        let err = verify_proof_preflight(&[0u8; 33], &[]).unwrap_err();
+        assert!(err.contains("32-byte aligned"), "got: {err}");
     }
 
     #[test]
