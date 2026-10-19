@@ -1,8 +1,7 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
-import { stellarExpertUrl } from "@/lib/explorer";
-import { fetchTransactionFee, formatStroopsAsXlm, type TransactionFee } from "@/lib/tx-fee";
+import { useState } from "react";
+import { ProofStatusStepper, type ProofStep } from "./ProofStatusStepper";
 
 // ── Tooltip data ──────────────────────────────────────────────────────────────
 
@@ -295,6 +294,8 @@ export function ProofExplorer({ data }: ProofExplorerProps) {
 
   return (
     <div style={{ padding: "12px 0" }}>
+      <ProofStatusStepper active={data?.showdownTxHash ? "settle" : data?.dealTxHash ? "verify" : "shuffle" as ProofStep} />
+      <div style={{ height: 10 }} />
       {/* How it works collapsible */}
       <button
         onClick={() => setHowItWorksOpen((v) => !v)}

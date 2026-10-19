@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { GameState, GamePhase } from "@/lib/game-state";
 import * as api from "@/lib/api";
 import { joinTableOnChain, playerActionOnChain } from "@/lib/onchain";
@@ -76,6 +76,7 @@ export function usePokerActions(config: PokerActionsConfig) {
     action: string;
     amount?: number;
   } | null>(null);
+  const optimisticSnapshot = useRef<GameState | null>(null);
 
   const joinTableSim = useJoinTableSimulation(wallet, async () => {
     await syncOnChainState();
@@ -85,7 +86,18 @@ export function usePokerActions(config: PokerActionsConfig) {
   const playerActionSim = usePlayerActionSimulation(wallet, async () => {
     await syncOnChainState();
     setPendingAction(null);
+    optimisticSnapshot.current = null;
   });
+
+  // Failed simulation/submission must never leave the table showing a bet that
+  // did not reach the chain.
+  useEffect(() => {
+    if (playerActionSim.error && optimisticSnapshot.current) {
+      setGame(optimisticSnapshot.current);
+      optimisticSnapshot.current = null;
+      setPendingAction(null);
+    }
+  }, [playerActionSim.error, setGame]);
 
   const claimedWallets = (lobby?.seats ?? [])
     .map((seat) => seat.wallet_address)
@@ -399,6 +411,21 @@ export function usePokerActions(config: PokerActionsConfig) {
               : undefined;
           
           // Store pending action and start simulation
+          optimisticSnapshot.current = game;
+          if (wallet && normalizedAmount !== undefined) {
+            setGame((prev) => {
+              const me = prev.players.find((player) => player.address === wallet.address);
+              if (!me) return prev;
+              const committed = action === "call" ? Math.min(normalizedAmount, me.stack) : normalizedAmount;
+              return {
+                ...prev,
+                pot: prev.pot + committed,
+                players: prev.players.map((player) => player.address === wallet.address
+                  ? { ...player, stack: Math.max(0, player.stack - committed), betThisRound: player.betThisRound + committed }
+                  : player),
+              };
+            });
+          }
           setPendingAction({ action: action as string, amount: normalizedAmount });
           playerActionSim.performAction(
             tableId,
