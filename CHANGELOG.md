@@ -9,6 +9,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **#622** Seats play an arrival animation when a player sits down (`seat-arrive`, disabled under `prefers-reduced-motion`); e2e test for the join-by-ID flow
+- **#623** Documented repaint-cost and OLED dark-theme tradeoffs in `docs/pixel-art-theme-guide.md` (section 9); no rendering change
+- **#624** In-table rules popover (`RULES`) showing blinds, antes, buy-ins, rake, rebuys and time limits read from `get_table`; re-reads when `get_config_version` changes while open
+- **#625** Proof explorer drill-down per phase: proof size, verifier tx link on stellar.expert, fee charged (Horizon `fee_charged`), and deck root / hand commitments for the deal proof
+
+### Added
 - **#136** CSP violation report ingestion via `report-uri`/`report-to` directives; `Content-Security-Policy-Report-Only` + `Reporting-Endpoints` headers in Next.js frontend; coordinator `POST /api/csp/report` and `GET /api/csp/reports` endpoints; in-memory store with Prometheus metrics; Grafana dashboard `security-csp-dashboard.json`.
 
 ### Added

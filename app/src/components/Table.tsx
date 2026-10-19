@@ -31,6 +31,7 @@ import { useWalletMonitor } from "@/lib/use-wallet-monitor";
 import { GameBoyButton, GameBoyModal } from "./GameBoyModal";
 import { HandHistoryPanel } from "./HandHistoryPanel";
 import { ProofExplorerPanel } from "./ProofExplorerPanel";
+import { TableRulesPopover } from "./TableRulesPopover";
 import { HandReplayer } from "./HandReplayer";
 import { HandTimeline } from "./HandTimeline";
 import { MobileActionBar } from "./MobileActionBar";
@@ -194,6 +195,23 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
   const chatRateLimiterRef = useRef(createChatRateLimiter());
   const [newMessagesCount, setNewMessagesCount] = useState(0);
   const [seatEmotes, setSeatEmotes] = useState<Record<number, string>>({});
+
+  // Seat occupancy (#622): addresses that took a seat since the last update,
+  // so their seat can play its arrival animation. The first render only
+  // records who is already seated, so opening a busy table animates nobody.
+  const seatedAddressesRef = useRef<Set<string> | null>(null);
+  const [justSeatedAddresses, setJustSeatedAddresses] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    const current = new Set(game.players.map((p) => p.address));
+    const previous = seatedAddressesRef.current;
+    seatedAddressesRef.current = current;
+    if (!previous) return;
+    const arrived = [...current].filter((address) => !previous.has(address));
+    if (arrived.length === 0) return;
+    setJustSeatedAddresses(new Set(arrived));
+    const timer = window.setTimeout(() => setJustSeatedAddresses(new Set()), 1200);
+    return () => window.clearTimeout(timer);
+  }, [game.players]);
   const wsRef = useRef<WebSocket | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const autoStreetRef = useRef<string>("");
@@ -1166,6 +1184,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
             >
               PROOFS
             </button>
+            <TableRulesPopover tableId={tableId} address={userAddress} />
             {userAddress && (
               <button
                 onClick={() => setAutoRebuyOpen(true)}
@@ -1378,6 +1397,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
                   <PlayerSeat
                     key={player.address}
                     player={player}
+                    justSeated={justSeatedAddresses.has(player.address)}
                     isCurrentTurn={displayedTurnAddress === player.address}
                     isDealer={player.seat === game.dealerSeat}
                     isUser={false}
@@ -1470,6 +1490,7 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
               {userPlayer ? (
                 <PlayerSeat
                   player={userPlayer}
+                  justSeated={justSeatedAddresses.has(userPlayer.address)}
                   isCurrentTurn={isMyTurn}
                   isDealer={userPlayer.seat === game.dealerSeat}
                   isUser={true}
@@ -1602,6 +1623,17 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
       <ProofExplorerPanel
         open={proofPanelOpen}
         onClose={() => setProofPanelOpen(false)}
+        data={{
+          dealTxHash: game.proofTxHashes?.deal,
+          revealTxHashes: {
+            flop: game.proofTxHashes?.flop,
+            turn: game.proofTxHashes?.turn,
+            river: game.proofTxHashes?.river,
+          },
+          showdownTxHash: game.proofTxHashes?.showdown,
+          proofSizes: game.proofSizes,
+          dealPublicInputs: game.dealPublicInputs,
+        }}
       />
 
       {userAddress && (
