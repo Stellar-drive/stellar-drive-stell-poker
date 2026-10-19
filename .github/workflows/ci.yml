@@ -71,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [poker-table, zk-verifier, committee-registry, game-hub, player-rating, stellar-zk-cards, stellar-drive-stell-poker-test-vectors]
+        package: [poker-table, zk-verifier, committee-registry, game-hub, player-rating, protocol-treasury, stellar-zk-cards, stellar-drive-stell-poker-test-vectors]
     steps:
       - uses: actions/checkout@v4
 
