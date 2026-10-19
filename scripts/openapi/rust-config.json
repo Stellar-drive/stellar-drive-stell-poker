@@ -1,0 +1,17 @@
+{
+  "crateName": "stellar-drive-stell-poker_coordinator_sdk",
+  "crateVersion": "0.1.0",
+  "packageName": "stellar-drive-stell-poker-coordinator-sdk",
+  "packageVersion": "0.1.0",
+  "packageAuthors": "stellar-drive-stell-poker Team <dev@stellar-drive-stell-poker.com>",
+  "packageRepository": "https://github.com/Stellar-drive/stellar-drive-stell-poker",
+  "packageDescription": "Auto-generated Rust client SDK for stellar-drive-stell-poker Coordinator API",
+  "packageTitle": "stellar-drive-stell-poker Coordinator SDK",
+  "packageLicense": "MIT",
+  "documentationUrl": "https://docs.stellar-drive-stell-poker.com",
+  "edition": "2021",
+  "library": true,
+  "hideModels": false,
+  "supportAsync": true,
+  "support": "async"
+}

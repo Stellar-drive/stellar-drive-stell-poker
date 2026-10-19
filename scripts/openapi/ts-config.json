@@ -1,0 +1,15 @@
+{
+  "npmName": "@stellar-drive-stell-poker/coordinator-sdk",
+  "npmRepository": "https://registry.npmjs.org",
+  "supportsES6": true,
+  "typescriptVersion": "~5.3.0",
+  "modelPackage": "models",
+  "apiPackage": "api",
+  "packageName": "@stellar-drive-stell-poker/coordinator-sdk",
+  "description": "Auto-generated TypeScript client SDK for stellar-drive-stell-poker Coordinator API",
+  "gitUserId": "Stellar-drive",
+  "gitRepoId": "stellar-drive-stell-poker",
+  "npmAuthor": "stellar-drive-stell-poker Team",
+  "npmAuthorEmail": "dev@stellar-drive-stell-poker.com",
+  "license": "MIT"
+}
