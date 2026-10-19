@@ -1,3 +1,5 @@
+import { REQUEST_ID_HEADER, createRequestId, withSupportRef } from "./request-id";
+
 const API_BASE = process.env.NEXT_PUBLIC_COORDINATOR_URL || "http://localhost:8080";
 const INSECURE_AUTH_ENV = process.env.NEXT_PUBLIC_ALLOW_INSECURE_DEV_AUTH;
 /** COORDINATOR API BASE.
@@ -314,13 +316,36 @@ async function readApiError(res: Response, fallback: string): Promise<string> {
 export class ApiRequestError extends Error {
   readonly status: number;
   readonly retryAfterSeconds: number | null;
+  /** Client-generated id sent as `X-Request-Id` on the failed call (#633). */
+  readonly requestId: string | null;
 
-  constructor(message: string, status: number, retryAfterSeconds: number | null) {
+  constructor(
+    message: string,
+    status: number,
+    retryAfterSeconds: number | null,
+    requestId: string | null = null
+  ) {
     super(message);
     this.name = "ApiRequestError";
     this.status = status;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.requestId = requestId;
   }
+}
+
+/** Remembers the correlation id each response was requested with (#633). */
+const requestIdByResponse = new WeakMap<Response, string>();
+
+/** `fetch` for coordinator calls: tags every request with a fresh `X-Request-Id` (#633). */
+async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const requestId = createRequestId();
+  const headers = new Headers(init.headers);
+  headers.set(REQUEST_ID_HEADER, requestId);
+  const res = await fetch(url, { ...init, headers });
+  if (res && typeof res === "object") {
+    requestIdByResponse.set(res, requestId);
+  }
+  return res;
 }
 
 function parseRetryAfterSeconds(res: Response): number | null {
@@ -331,8 +356,14 @@ function parseRetryAfterSeconds(res: Response): number | null {
 }
 
 async function apiError(res: Response, fallback: string): Promise<ApiRequestError> {
+  const requestId = requestIdByResponse.get(res) ?? null;
   const message = await readApiError(res, fallback);
-  return new ApiRequestError(message, res.status, parseRetryAfterSeconds(res));
+  return new ApiRequestError(
+    requestId ? withSupportRef(message, requestId) : message,
+    res.status,
+    parseRetryAfterSeconds(res),
+    requestId
+  );
 }
 
 function nextNonce(): string {
@@ -401,7 +432,7 @@ async function authedFetch(
   auth: AuthSigner
 ): Promise<Response> {
   if (USE_INSECURE_DEV_AUTH) {
-    const insecureAttempt = await fetch(
+    const insecureAttempt = await apiFetch(
       url,
       withMergedHeaders(init, buildInsecureHeaders(auth))
     );
@@ -411,7 +442,7 @@ async function authedFetch(
   }
 
   const signedHeaders = await buildAuthHeaders(tableId, action, auth);
-  return fetch(url, withMergedHeaders(init, signedHeaders));
+  return apiFetch(url, withMergedHeaders(init, signedHeaders));
 }
 
 /** Runs Deal.
@@ -426,7 +457,7 @@ export async function requestDeal(
   players: string[] = [],
   _auth: AuthSigner
 ): Promise<DealResponse> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_BASE}/api/table/${tableId}/request-deal`,
     {
       method: "POST",
@@ -522,7 +553,7 @@ export async function joinTable(
  * @remarks Calls the coordinator REST API.
  */
 export async function listOpenTables(): Promise<OpenTablesResponse> {
-  const res = await fetch(`${API_BASE}/api/tables/open`);
+  const res = await apiFetch(`${API_BASE}/api/tables/open`);
   if (!res.ok) {
     throw await apiError(res, `Open tables failed: ${res.status}`);
   }
@@ -531,7 +562,7 @@ export async function listOpenTables(): Promise<OpenTablesResponse> {
 
 /** Issue #53 — all known tables with seat counts and chip stacks. */
 export async function listTableOverview(): Promise<TableOverviewResponse> {
-  const res = await fetch(`${API_BASE}/api/tables/overview`);
+  const res = await apiFetch(`${API_BASE}/api/tables/overview`);
   if (!res.ok) {
     throw await apiError(res, `Table overview failed: ${res.status}`);
   }
@@ -542,7 +573,7 @@ export async function listTableOverview(): Promise<TableOverviewResponse> {
 export async function getPlayerHudStats(
   address: string
 ): Promise<PlayerHudStats> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_BASE}/api/stats/player/${encodeURIComponent(address)}`
   );
   if (!res.ok) {
@@ -556,7 +587,7 @@ export async function getRatingLeaderboard(
   offset = 0,
   limit = 20
 ): Promise<RatingLeaderboardResponse> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_BASE}/api/ratings/leaderboard?offset=${offset}&limit=${limit}`
   );
   if (!res.ok) {
@@ -570,7 +601,7 @@ export async function getRatingLeaderboard(
  * @remarks Calls the coordinator REST API.
  */
 export async function getChainConfig(): Promise<ChainConfigResponse> {
-  const res = await fetch(`${API_BASE}/api/chain-config`);
+  const res = await apiFetch(`${API_BASE}/api/chain-config`);
   if (!res.ok) {
     throw await apiError(res, `Chain config failed: ${res.status}`);
   }
@@ -585,7 +616,7 @@ export async function getChainConfig(): Promise<ChainConfigResponse> {
 export async function getTableLobby(
   tableId: number
 ): Promise<TableLobbyResponse> {
-  const res = await fetch(`${API_BASE}/api/table/${tableId}/lobby`);
+  const res = await apiFetch(`${API_BASE}/api/table/${tableId}/lobby`);
   if (!res.ok) {
     throw await apiError(res, `Lobby lookup failed: ${res.status}`);
   }
@@ -604,7 +635,7 @@ export async function requestReveal(
   phase: "flop" | "turn" | "river",
   _auth: AuthSigner
 ): Promise<RevealResponse> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_BASE}/api/table/${tableId}/request-reveal/${phase}`,
     {
       method: "POST",
@@ -626,7 +657,7 @@ export async function requestShowdown(
   tableId: number,
   _auth: AuthSigner
 ): Promise<ShowdownResponse> {
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_BASE}/api/table/${tableId}/request-showdown`,
     {
       method: "POST",
@@ -735,7 +766,7 @@ export async function getPlayerCards(
 export async function getTableState(
   tableId: number
 ): Promise<TableStateResponse> {
-  const res = await fetch(`${API_BASE}/api/table/${tableId}/state`);
+  const res = await apiFetch(`${API_BASE}/api/table/${tableId}/state`);
   if (!res.ok) {
     throw await apiError(res, `Failed to get table state: ${res.status}`);
   }
@@ -752,7 +783,7 @@ export interface SpectatorCountResponse {
 export async function getSpectatorCount(
   tableId: number
 ): Promise<SpectatorCountResponse> {
-  const res = await fetch(`${API_BASE}/api/table/${tableId}/spectators`);
+  const res = await apiFetch(`${API_BASE}/api/table/${tableId}/spectators`);
   if (!res.ok) {
     throw await apiError(res, `Failed to get spectators: ${res.status}`);
   }
@@ -782,7 +813,7 @@ export async function getParsedTableState(
  * @remarks Calls the coordinator REST API.
  */
 export async function getCommitteeStatus(): Promise<CommitteeStatusResponse> {
-  const res = await fetch(`${API_BASE}/api/committee/status`);
+  const res = await apiFetch(`${API_BASE}/api/committee/status`);
   if (!res.ok) throw new Error(`Failed to get status: ${res.status}`);
   return res.json();
 }
@@ -816,7 +847,7 @@ export interface StatsResponse {
  * @remarks Calls the coordinator REST API.
  */
 export async function getStats(): Promise<StatsResponse> {
-  const res = await fetch(`${API_BASE}/api/stats`);
+  const res = await apiFetch(`${API_BASE}/api/stats`);
   if (!res.ok) throw new Error(`Failed to get stats: ${res.status}`);
   return res.json();
 }
@@ -847,7 +878,7 @@ export interface TableMpcStatusResponse {
 export async function getMpcStatus(
   tableId: number
 ): Promise<TableMpcStatusResponse> {
-  const res = await fetch(`${API_BASE}/api/table/${tableId}/mpc-status`);
+  const res = await apiFetch(`${API_BASE}/api/table/${tableId}/mpc-status`);
   if (!res.ok) {
     throw await apiError(res, `MPC status failed: ${res.status}`);
   }
@@ -870,7 +901,7 @@ export interface WalletVerifyResponse {
  * @remarks Calls the coordinator REST API.
  */
 export async function getWalletChallenge(address: string): Promise<WalletChallengeResponse> {
-  const res = await fetch(`${API_BASE}/api/wallet/challenge`, {
+  const res = await apiFetch(`${API_BASE}/api/wallet/challenge`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -895,7 +926,7 @@ export async function verifyWalletChallenge(
   challenge: string,
   signature: string
 ): Promise<WalletVerifyResponse> {
-  const res = await fetch(`${API_BASE}/api/wallet/verify`, {
+  const res = await apiFetch(`${API_BASE}/api/wallet/verify`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
