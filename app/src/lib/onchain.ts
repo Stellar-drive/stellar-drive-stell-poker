@@ -10,6 +10,7 @@ import {
 } from "@stellar/stellar-sdk";
 import type { WalletSession } from "./wallet";
 import { getChainConfig } from "./api";
+import { assertOnline } from "./online";
 import {
   parseContractMetrics,
   parseTableMetrics,
@@ -155,6 +156,8 @@ async function submitWalletTx(
   method: string,
   args: xdr.ScVal[]
 ): Promise<string | undefined> {
+  // Transactions are never queued for later: refuse while offline (#632).
+  assertOnline();
   const cfg = await getConfig();
   const server = new rpc.Server(cfg.rpcUrl, { allowHttp: cfg.rpcUrl.startsWith("http://") });
 
@@ -435,6 +438,7 @@ async function submitAvatarTx(
   method: string,
   args: xdr.ScVal[]
 ): Promise<string | undefined> {
+  assertOnline();
   const cfg = await getConfig();
   const avatarContract = (cfg as unknown as { player_avatar_contract?: string }).player_avatar_contract;
   if (!avatarContract) {

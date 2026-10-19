@@ -1,4 +1,5 @@
 import { REQUEST_ID_HEADER, createRequestId, withSupportRef } from "./request-id";
+import { assertOnline } from "./online";
 
 const API_BASE = process.env.NEXT_PUBLIC_COORDINATOR_URL || "http://localhost:8080";
 const INSECURE_AUTH_ENV = process.env.NEXT_PUBLIC_ALLOW_INSECURE_DEV_AUTH;
@@ -338,6 +339,10 @@ const requestIdByResponse = new WeakMap<Response, string>();
 
 /** `fetch` for coordinator calls: tags every request with a fresh `X-Request-Id` (#633). */
 async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  // Game actions need the coordinator, so writes are refused while offline (#632).
+  if (init.method && init.method.toUpperCase() !== "GET") {
+    assertOnline();
+  }
   const requestId = createRequestId();
   const headers = new Headers(init.headers);
   headers.set(REQUEST_ID_HEADER, requestId);
@@ -431,6 +436,11 @@ async function authedFetch(
   action: string,
   auth: AuthSigner
 ): Promise<Response> {
+  // Refuse before the wallet is asked to sign, so offline clicks never open a
+  // signature prompt (#632).
+  if (init.method && init.method.toUpperCase() !== "GET") {
+    assertOnline();
+  }
   if (USE_INSECURE_DEV_AUTH) {
     const insecureAttempt = await apiFetch(
       url,
