@@ -43,6 +43,18 @@ start:
 stop:
 	docker-compose down
 
+## pr-preview: Start an isolated preview stack for a PR. Usage: make pr-preview PR=123.
+.PHONY: pr-preview
+pr-preview:
+	@test -n "$(PR)" || (echo "usage: make pr-preview PR=<n>" >&2; exit 2)
+	./scripts/pr-preview.sh up $(PR)
+
+## pr-preview-down: Tear down a PR preview stack (run on merge/close). Usage: make pr-preview-down PR=123.
+.PHONY: pr-preview-down
+pr-preview-down:
+	@test -n "$(PR)" || (echo "usage: make pr-preview-down PR=<n>" >&2; exit 2)
+	./scripts/pr-preview.sh down $(PR)
+
 ## clean: Remove build artifacts (cargo target dirs, frontend build output and node_modules).
 .PHONY: clean
 clean:
