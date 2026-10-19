@@ -84,6 +84,7 @@ import { playSound } from "@/lib/sound-engine";
 import { useAutoRebuy } from "@/lib/use-auto-rebuy";
 import { AutoRebuySettings } from "./AutoRebuySettings";
 import { TurnTimerSettings } from "./TurnTimerSettings";
+import { TurnCountdownBanner } from "./TurnCountdownBanner";
 import { useTurnTimer } from "@/lib/use-turn-timer";
 
 type ActiveRequest = "deal" | "flop" | "turn" | "river" | "showdown" | null;
@@ -1336,6 +1337,17 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
             </span>
           </div>
         )}
+
+        {/* Turn countdown with auto-fold toggle and screen-reader
+            announcements (#630). Sits above the table so it is seen on phones
+            as well as desktop. */}
+        <TurnCountdownBanner
+          active={turnTimer.isActive}
+          timeLeftSeconds={turnTimer.timeLeftSeconds}
+          durationSeconds={turnTimer.durationSeconds}
+          autoFoldOn={turnTimer.preference.enabled && turnTimer.preference.autoAction !== "never"}
+          onAutoFoldChange={turnTimer.setAutoFold}
+        />
 
         {/* ═══ THE POKER TABLE ═══ */}
         <div className="table-container w-full max-w-3xl relative" style={{ minHeight: "400px" }}>
