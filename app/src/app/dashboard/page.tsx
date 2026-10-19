@@ -182,6 +182,14 @@ export default function PlayerDashboardPage() {
               </div>
             )}
 
+            <Link
+              href="/portfolio"
+              className="text-[8px]"
+              style={{ color: "#f1c40f", textDecoration: "none" }}
+            >
+              VIEW PORTFOLIO →
+            </Link>
+
             {busy ? (
               <div className="text-[9px]" style={{ color: "#8a9ab0" }} aria-live="polite">
                 CALCULATING LIFETIME STATS…
