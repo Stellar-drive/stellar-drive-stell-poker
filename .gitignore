@@ -51,3 +51,6 @@ app/e2e/tests/screenshot-snapshots/__diff_output__/
 
 *storybook.log
 storybook-static
+
+# Audit log WORM exports (scripts/export_audit_worm.py)
+worm/

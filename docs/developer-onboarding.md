@@ -5,6 +5,11 @@ before moving on, because everything below assumes it worked.
 
 Budget roughly an hour on a fast machine; the Rust and circuit builds dominate.
 
+**Automated check:** run `make preflight` to verify the toolchain, `.env`, and
+local service health in one pass. Every failure prints a fix hint, so use it
+instead of walking the checklist by hand whenever you want to confirm your
+environment.
+
 ---
 
 ## 0. Toolchain

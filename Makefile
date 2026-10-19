@@ -61,6 +61,11 @@ clean:
 	cargo clean
 	rm -rf app/.next app/node_modules
 
+## preflight: Verify prerequisites (tools, env, services health) before building.
+.PHONY: preflight
+preflight:
+	./scripts/preflight.sh
+
 ## ci: Run the same checks CI runs (fmt, clippy, tests, build) locally before pushing.
 .PHONY: ci
 ci: lint test build
