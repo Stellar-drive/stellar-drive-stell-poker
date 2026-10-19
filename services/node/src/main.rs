@@ -49,6 +49,7 @@ mod redact;
 mod profiling;
 mod session;
 mod tls;
+mod trace_context;
 
 use limits::ResourceLimits;
 use metrics::NodeMetrics;
@@ -313,6 +314,8 @@ async fn main() {
             "/session/:id/profile",
             post(api::post_enable_profiling).get(api::get_profile),
         )
+        // Continue the coordinator's W3C trace on every handler (Issue #672).
+        .layer(axum::middleware::from_fn(trace_context::propagate))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
