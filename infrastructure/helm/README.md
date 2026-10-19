@@ -29,6 +29,21 @@ docker build -f services/node/Dockerfile -t ghcr.io/<org>/stellar-drive-stell-po
 docker build -f app/Dockerfile -t ghcr.io/<org>/stellar-drive-stell-poker/frontend:latest app/
 ```
 
+## Verifying image signatures (required)
+
+CI signs every image it pushes with cosign (`.github/workflows/docker-build-push.yml`).
+Before `helm install` / `helm upgrade`, verify each image:
+
+```bash
+./scripts/verify-image-signature.sh ghcr.io/<org>/stellar-drive-stell-poker/coordinator:<tag>
+./scripts/verify-image-signature.sh ghcr.io/<org>/stellar-drive-stell-poker/mpc-node:<tag>
+./scripts/verify-image-signature.sh ghcr.io/<org>/stellar-drive-stell-poker/frontend:<tag>
+```
+
+The check is fail-closed: an unsigned image makes the script exit non-zero and the
+deploy must abort. See [DEPLOYMENT.md](../../DEPLOYMENT.md) for the documented
+failure mode.
+
 ## Installing the charts
 
 ### 1. soroban-rpc-proxy
