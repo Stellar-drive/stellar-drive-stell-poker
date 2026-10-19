@@ -17,6 +17,7 @@ import {
   type TableMetrics,
 } from "./contract-metrics";
 import { fetchPlayerPositions, type PlayerPosition } from "./player-positions";
+import { parseTableRules, type TableRules } from "./table-rules";
 
 type LobstrSignResult = {
   signedTxXdr?: string;
@@ -355,6 +356,40 @@ export async function getTableConfig(
     tokenContract: native.config.token,
     bigBlind: firstLevel ? BigInt(firstLevel.big_blind) : BigInt(0),
   };
+}
+
+/**
+ * Reads a table's `config_version` via `get_config_version` (#624). This is
+ * the cheap check the rules popover polls: it only changes when the table's
+ * rules do, so the full config is re-read only then.
+ */
+export async function getTableConfigVersion(
+  sourceAddress: string,
+  tableId: number
+): Promise<number> {
+  const cfg = await getConfig();
+  const native = await simulateReadCall(sourceAddress, cfg.pokerTableContract, "get_config_version", [
+    nativeToScVal(tableId, { type: "u32" }),
+  ]);
+  return Number(native);
+}
+
+/**
+ * Reads everything the in-table rules popover shows (#624): the full table
+ * config from `get_table`, tagged with the `config_version` it was read at.
+ */
+export async function getTableRules(
+  sourceAddress: string,
+  tableId: number
+): Promise<TableRules> {
+  const cfg = await getConfig();
+  const [version, table] = await Promise.all([
+    getTableConfigVersion(sourceAddress, tableId),
+    simulateReadCall(sourceAddress, cfg.pokerTableContract, "get_table", [
+      nativeToScVal(tableId, { type: "u32" }),
+    ]),
+  ]);
+  return parseTableRules(table, version);
 }
 
 /** Reads a seated player's rebuy count so far this session, via `get_player_buy_in` (Issue #164). */

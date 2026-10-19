@@ -329,3 +329,57 @@ Use this checklist when creating a new theme:
 | `app/src/components/PlayerSeat.tsx` | Player seat with avatar and cards |
 | `app/public/cat_sprites/` | Cat PNG assets |
 | `app/public/music/` | Ambient music MP3 files |
+
+---
+
+## 9. Repaint Cost and Dark Themes (OLED)
+
+This section records the tradeoffs behind a darker, lower-power theme (#623).
+It is documentation only: no measurements were taken for it, and the code is
+unchanged.
+
+### Where repaint cost comes from
+
+- **Continuous animations.** `PixelWorld.tsx` runs an infinite `twinkle`
+  animation on every star and an infinite `cloudFloat2` on each cloud. Each one
+  repaints on every frame for as long as the page is open.
+- **Animated box-shadow.** The `seatPulse` keyframe in `globals.css` animates
+  `box-shadow` on the acting player's seat. Changing `box-shadow` forces a
+  repaint of the element and its surroundings, which costs more than animating
+  `transform` or `opacity`.
+- **Large bright areas.** The felt gradient, the pixel sky, and the card-face
+  gradient in `Card.tsx` cover most of the viewport, so they set most of the
+  panel's pixel luminance.
+
+### What a dark theme saves, and what it does not
+
+- On **OLED** panels, a pixel that is off uses no power, so power falls roughly
+  with the average luminance of the lit pixels. A darker sky and felt reduce it.
+- On **LCD** panels the backlight is always on, so a darker theme saves little
+  or nothing. The savings depend on the display, not the page.
+- Animations cost CPU and GPU time on any panel. A dark theme does not reduce
+  them.
+
+### Tradeoffs
+
+- **Readability.** Card faces need to stay light for contrast. Text on dark
+  backgrounds should meet WCAG AA contrast (4.5:1 for body text).
+- **Identity.** Much of the pixel-art palette (felt, chips, card backs) is
+  tuned for a light sky. A dark variant changes the mood, so it should be an
+  opt-in theme and not the default.
+- **Implementation cost.** A `<canvas>` renderer for cards would replace
+  working DOM components, lose text selection and accessibility semantics, and
+  need its own tests. A CSS-variable theme (section 1) gets most of the gain
+  without that cost.
+
+### Recommendation
+
+1. Ship the darker palette as a CSS-variable override (section 1), selected by
+   a `data-theme` attribute. No new rendering path is needed.
+2. Move `seatPulse` from `box-shadow` to a pseudo-element with `opacity`
+   animated, to avoid the repaint.
+3. Pause the infinite `twinkle` and `cloudFloat2` animations when the tab is
+   hidden or when `prefers-reduced-motion` is set.
+4. Before choosing a canvas renderer, measure with the browser's Performance
+   panel (Paint flashing and the Rendering tab) on a representative table. Only
+   proceed to canvas if paint time, not animation, is the measured bottleneck.

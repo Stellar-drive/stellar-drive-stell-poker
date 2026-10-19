@@ -171,6 +171,13 @@ export function usePokerActions(config: PokerActionsConfig) {
           pot: playMode === "single" ? 0 : prev.pot,
           lastTxHash: txHash,
           proofSize: result.proof_size,
+          // A new hand starts a fresh proof trail (#625).
+          proofTxHashes: txHash ? { deal: txHash } : {},
+          proofSizes: { deal: result.proof_size },
+          dealPublicInputs: {
+            deckRoot: result.deck_root,
+            handCommitments: result.hand_commitments,
+          },
           onChainConfirmed: !!txHash,
           players: playMode === "single"
             ? prev.players.map((p) => ({
@@ -223,6 +230,8 @@ export function usePokerActions(config: PokerActionsConfig) {
           boardCards: [...prev.boardCards, ...result.cards],
           lastTxHash: txHash ?? prev.lastTxHash,
           proofSize: result.proof_size,
+          proofTxHashes: txHash ? { ...prev.proofTxHashes, [phase]: txHash } : prev.proofTxHashes,
+          proofSizes: { ...prev.proofSizes, [phase]: result.proof_size },
           onChainConfirmed: !!txHash || prev.onChainConfirmed,
         }));
         await syncOnChainState();
@@ -274,6 +283,8 @@ export function usePokerActions(config: PokerActionsConfig) {
         phase: "settlement" as GamePhase,
         lastTxHash: txHash ?? prev.lastTxHash,
         proofSize: result.proof_size,
+        proofTxHashes: txHash ? { ...prev.proofTxHashes, showdown: txHash } : prev.proofTxHashes,
+        proofSizes: { ...prev.proofSizes, showdown: result.proof_size },
         onChainConfirmed: !!txHash || prev.onChainConfirmed,
       }));
       await syncOnChainState();

@@ -45,6 +45,8 @@ interface PlayerSeatProps {
   turnTimerDurationSeconds?: number;
   /** If true, pulse red near expiration. #154 */
   turnTimerUrgent?: boolean;
+  /** Plays the arrival animation: this player has just taken the seat (#622). */
+  justSeated?: boolean;
 }
 
 function formatPct(n: number): string {
@@ -78,6 +80,7 @@ export function PlayerSeat({
   turnTimerSecondsLeft,
   turnTimerDurationSeconds,
   turnTimerUrgent,
+  justSeated = false,
 }: PlayerSeatProps) {
   const [showAvatarPicker, setShowAvatarPicker] = useState(false);
   const t = useT();
@@ -119,7 +122,7 @@ export function PlayerSeat({
 
   return (
     <div
-      className={`relative flex flex-col items-center gap-1${showStatsTooltip && !isBot ? " has-stats-tooltip" : ""}`}
+      className={`relative flex flex-col items-center gap-1${showStatsTooltip && !isBot ? " has-stats-tooltip" : ""}${justSeated ? " seat-arrive" : ""}`}
       style={{
         opacity: player.folded ? 0.5 : 1,
         // Pulse glow on user's own seat when it's their turn (#47).

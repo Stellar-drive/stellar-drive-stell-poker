@@ -222,6 +222,17 @@ body {
   50% { box-shadow: 0 0 0 5px #f1c40f, 0 0 28px 10px rgba(241,196,15,0.65); }
 }
 
+/* Seat occupancy: a player who has just sat down settles into their seat (#622) */
+@keyframes seatArrive {
+  0% { transform: translateY(-10px) scale(0.92); opacity: 0; }
+  60% { transform: translateY(2px) scale(1.03); opacity: 1; }
+  100% { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+.seat-arrive {
+  animation: seatArrive 0.6s ease-out;
+}
+
 /* Game Boy modal slide in */
 @keyframes gameboySlideIn {
   0% { transform: translateY(30px) scale(0.95); opacity: 0; }
@@ -297,7 +308,8 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .animate-card-deal,
   .card-flip,
-  .card-flip-inner {
+  .card-flip-inner,
+  .seat-arrive {
     animation: none;
   }
   .card-flip {
