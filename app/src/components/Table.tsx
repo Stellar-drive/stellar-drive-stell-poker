@@ -44,6 +44,11 @@ import { ThemeSelector } from "./ThemeSelector";
 import { Skeleton } from "./Skeleton";
 import { TableMiniMap } from "./TableMiniMap";
 import { LanguageSelector } from "./LanguageSelector";
+import {
+  saveTableCache,
+  isCacheStale,
+  formatLastUpdated,
+} from "@/lib/lobby-cache";
 import { useI18n, useT } from "@/lib/i18n/context";
 import { usePokerActions } from "@/lib/use-poker-actions";
 import { getDealerLine } from "@/lib/dealer-lines";
@@ -161,6 +166,8 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
   const [onChainPhase, setOnChainPhase] = useState<string>("unknown");
   const [winnerAddress, setWinnerAddress] = useState<string | null>(null);
   const [lobby, setLobby] = useState<api.TableLobbyResponse | null>(null);
+  const [isWalletDisconnected, setIsWalletDisconnected] = useState(false);
+  const [tableCachedAt, setTableCachedAt] = useState<number>(0);
   const [showSkeleton, setShowSkeleton] = useState<boolean>(true);
   const [botLine, setBotLine] = useState<string | null>(null);
   const [gameboyOpen, setGameboyOpen] = useState(false);
@@ -645,13 +652,16 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
     };
   }, [wallet]);
 
-  // Auto-logout when wallet disconnects (#322).
+  // Auto-logout when wallet disconnects (#322, #618).
+  // Preserves table state for read-only / spectator view with stale indicators.
   useWalletMonitor({
     wallet,
     onDisconnect: () => {
       setWallet(null);
-      setGame(createInitialState(tableId));
-      router.push("/");
+      setIsWalletDisconnected(true);
+      const now = Date.now();
+      setTableCachedAt(now);
+      saveTableCache(tableId, game, now);
     },
   });
 
@@ -1293,6 +1303,48 @@ export function Table({ tableId, initialPlayMode }: TableProps) {
           </div>
         </div>
 
+        {isWalletDisconnected && (
+          <div
+            className="pixel-border-thin flex items-center justify-between flex-wrap gap-2 p-2 mb-2 w-full max-w-3xl"
+            style={{
+              background: "rgba(35, 20, 8, 0.95)",
+              borderColor: isCacheStale(tableCachedAt) ? "#e74c3c" : "#f39c12",
+              color: "#f1c40f",
+              fontSize: "8px",
+            }}
+            data-testid="table-offline-banner"
+          >
+            <div className="flex items-center gap-2">
+              <span>⚠️</span>
+              <span>WALLET DISCONNECTED · READ-ONLY TABLE VIEW</span>
+              {tableCachedAt > 0 && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[7px]"
+                  style={{
+                    background: isCacheStale(tableCachedAt) ? "#e74c3c" : "#e67e22",
+                    color: "#ffffff",
+                  }}
+                  data-testid="table-stale-indicator"
+                >
+                  {isCacheStale(tableCachedAt) ? "STALE" : "CACHED"}
+                </span>
+              )}
+              {tableCachedAt > 0 && (
+                <span style={{ color: "#c8e6ff", fontSize: "7px" }}>
+                  Last updated: {formatLastUpdated(tableCachedAt)}
+                </span>
+              )}
+            </div>
+            <button
+              onClick={() => router.push("/")}
+              className="pixel-btn pixel-btn-green text-[8px]"
+              style={{ padding: "4px 8px" }}
+              data-testid="reconnect-table-btn"
+            >
+              RECONNECT
+            </button>
+          </div>
+        )}
 
         {/* Dealer line */}
         <div

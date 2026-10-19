@@ -369,6 +369,9 @@ jobs:
       - name: Lint
         run: cd app && npm run lint --if-present
 
+      - name: Check i18n key parity
+        run: cd app && npm run test:i18n
+
   frontend-build:
     name: Frontend build
     runs-on: ubuntu-latest
