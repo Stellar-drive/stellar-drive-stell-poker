@@ -89,6 +89,7 @@ mod session_isolation;
 mod session_migration;
 mod session_preemption;
 mod session_recovery;
+mod session_replay;
 mod soroban;
 mod spectators;
 mod submission_ledger;
@@ -825,6 +826,25 @@ async fn main() {
 
     session_gc::spawn_gc_task(Arc::clone(&mpc_sessions));
 
+    // Recover checkpoints written before a crash. The active table map is
+    // populated by the normal session/lobby restoration path; this preflight
+    // makes the decision explicit and prevents stale or malformed checkpoints
+    // from being silently retried.
+    match session_recovery::load_after_crash() {
+        Ok((resumable, aborted)) => {
+            tracing::info!(resumable = resumable.len(), aborted = aborted.len(),
+                "coordinator crash-recovery scan completed");
+            for session in aborted {
+                tracing::warn!(session_id = %session, "aborting malformed persisted MPC session");
+            }
+            for session in resumable {
+                tracing::info!(session_id = %session.session_id, phase = %session.phase,
+                    "persisted MPC session is eligible for resume");
+            }
+        }
+        Err(error) => tracing::error!(%error, "coordinator crash-recovery scan failed"),
+    }
+
     let stats_store = stats::new_store();
 
     let admin_config = AdminConfig::from_env();
@@ -1314,6 +1334,7 @@ async fn main() {
         .route("/", get(dashboard::dashboard_page))
         .route("/metrics", get(metrics_endpoint))
         .route("/api/health", get(health))
+        .route("/api/admin/deprecations", get(api_version::deprecation_report))
         .route("/api/leader", get(get_leader_status))
         .route("/api/stats", get(get_stats))
         .route("/api/benchmarks", get(get_benchmarks))
