@@ -975,3 +975,73 @@ textarea {
     min-height: 44px;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Right-to-Left (RTL) Layout Support (Issue #621)
+   Logical CSS properties and bidirectional layout handling
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+html[dir="rtl"] {
+  direction: rtl;
+  text-align: right;
+}
+
+html[dir="rtl"] body {
+  direction: rtl;
+}
+
+/* Logical positioning for floating controls */
+.app-top-controls {
+  position: absolute;
+  top: 8px;
+  inset-inline-end: 8px;
+  z-index: 9999;
+}
+
+/* RTL Proof Explorer Panel adjustments */
+html[dir="rtl"] .proof-panel {
+  right: auto;
+  left: 16px;
+}
+
+html[dir="rtl"] .proof-panel-resize {
+  left: auto;
+  right: -6px;
+}
+
+/* RTL Chat Drawer and toggle */
+html[dir="rtl"] .chat-toggle-btn {
+  right: auto !important;
+  left: 16px !important;
+}
+
+html[dir="rtl"] .chat-drawer {
+  right: auto !important;
+  left: 16px !important;
+}
+
+/* RTL Table header navigation */
+html[dir="rtl"] .table-header-left,
+html[dir="rtl"] .table-header-right {
+  flex-direction: row;
+}
+
+/* RTL text alignment and logical margins */
+html[dir="rtl"] .text-start {
+  text-align: right;
+}
+
+html[dir="rtl"] .text-end {
+  text-align: left;
+}
+
+[dir="rtl"] .ms-auto {
+  margin-right: auto;
+  margin-left: 0;
+}
+
+[dir="rtl"] .me-auto {
+  margin-left: auto;
+  margin-right: 0;
+}
+

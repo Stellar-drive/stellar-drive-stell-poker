@@ -36,7 +36,7 @@ export default function RootLayout({
     <html lang="en">
       <body>
         <I18nProvider>
-          <div style={{ position: "absolute", top: 8, right: 8, zIndex: 9999 }}>
+          <div className="app-top-controls" style={{ position: "absolute", top: 8, insetInlineEnd: 8, zIndex: 9999 }}>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <NotificationsCenter />
               <ThemeToggle />
