@@ -31,6 +31,12 @@ docker build -f app/Dockerfile -t ghcr.io/<org>/stellar-drive-stell-poker/fronte
 
 ## Installing the charts
 
+> **Staging:** apply the namespace guardrails first with
+> `kubectl apply -k infrastructure/k8s/staging`, then install each chart with
+> `--namespace stellar-drive-stell-poker-staging` (no `--create-namespace`). Every chart's
+> resources must fit the quota there; see
+> [../k8s/staging/README.md](../k8s/staging/README.md).
+
 ### 1. soroban-rpc-proxy
 
 ```bash

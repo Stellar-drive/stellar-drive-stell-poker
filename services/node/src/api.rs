@@ -488,7 +488,12 @@ pub async fn post_generate(
     let profiling_enabled = state.profiling.is_enabled(&sid).await;
     let profile = profiling_enabled.then(|| state.profiling.clone());
 
-    tokio::spawn(async move {
+    // tokio::spawn drops task-locals, so carry the request's trace context
+    // into the background proof task explicitly (Issue #672).
+    let trace = crate::trace_context::current()
+        .unwrap_or_else(crate::trace_context::TraceContext::new_root);
+
+    let task = async move {
         let phase_timeouts = session::PhaseTimeouts::from_env();
         let proof_future = session::run_proof_generation(
             sid.clone(),
@@ -587,7 +592,12 @@ pub async fn post_generate(
                 );
             }
         }
-    });
+    };
+    tokio::spawn(crate::trace_context::scope(
+        trace,
+        "mpc.proof_generation",
+        task,
+    ));
 
     Ok(StatusCode::ACCEPTED)
 }
