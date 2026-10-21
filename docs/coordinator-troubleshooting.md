@@ -2,6 +2,9 @@
 
 Common error codes and solutions for the stellar-drive-stell-poker coordinator.
 
+> **Paging:** triage here first; escalate per
+> [`incident-response.md`](incident-response.md) if customer impact warrants.
+
 ---
 
 ## Error Codes
