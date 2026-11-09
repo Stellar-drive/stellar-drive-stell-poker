@@ -435,3 +435,12 @@ export function CreateTableButton() {
 - [Node Decommission & Secure Reshuffle](docs/node-decommission-reshuffle.md)
 - [Node Build-Provenance Attestation](docs/node-attestation.md)
 - [MPC Session Preemption Policy](docs/mpc-preemption-policy.md)
+
+## Resolved Issues
+
+The following issues have been addressed in this release:
+
+- Added issue templates for bug reports and feature requests
+- Added contributing guidelines and CODEOWNERS
+- Improved repository documentation and onboarding
+
